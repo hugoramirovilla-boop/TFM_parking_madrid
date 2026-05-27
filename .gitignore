@@ -47,3 +47,9 @@ reports/entregable_descripcion_limpieza/**
 
 # Temporales
 tree_*.txt
+
+# Anaconda local artifacts
+anaconda_projects/
+
+# Archivos temporales de revisión interna
+reports/review/
