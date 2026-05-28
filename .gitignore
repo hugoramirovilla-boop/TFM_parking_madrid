@@ -53,3 +53,6 @@ anaconda_projects/
 
 # Archivos temporales de revisión interna
 reports/review/
+
+# Documentación fuente local no versionada
+docs/source_docs/
