@@ -18,7 +18,7 @@ Observaciones globales pendientes para notebooks específicos:
 - `ser_autorizaciones`: presenta cambios de esquema entre años.
 - `ser_parquimetros`: combina CSV tabular y KMZ geográfico.
 - `ser_padron_vehiculos_ivtm_barrio`: lectura inicial homogénea, pero requiere validación de etiqueta ambiental 0, códigos de barrio y agregación anual.
-- `emt_aparcamientos_publicos`: el CSV es usable; el JSON requiere revisión específica si se decide usarlo.
+- `emt_aparcamientos_publicos`: el CSV se adopta como formato canónico y se lee correctamente.
 - `emt_ocupacion_hora`: algunos CSV aparecen con lectura automática de 0 columnas; requiere revisión de separador, cabecera, encoding o contenido.
 - `emt_ocupacion_mensual_rotacional`: requiere lector específico por errores de parsing.
 - `contexto_calendario_laboral`: lectura inicial homogénea; requiere limpieza temporal y generación de variables de calendario.
