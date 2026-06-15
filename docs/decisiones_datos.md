@@ -15,11 +15,12 @@ El notebook central `02_descripcion_limpieza_datos.ipynb` no genera datos `inter
 La limpieza específica se organizará así:
 
 - `02_01_ser_tiques.ipynb`: limpieza individual de tiques SER.
-- `02_02_ser_oferta_espacial.ipynb`: limpieza de calles/plazas, zonas SER y parquímetros.
-- `02_03_ser_presion_estructural.ipynb`: limpieza de autorizaciones SER e IVTM por barrio.
-- `02_04_emt_inventario.ipynb`: limpieza de inventario EMT y aparcamientos públicos municipales.
-- `02_05_emt_historico.ipynb`: limpieza de históricos de ocupación EMT.
-- `02_06_contexto_calendario.ipynb`: limpieza del calendario laboral.
+- `02_02_cartografia_ser.ipynb`: limpieza de límite SER, barrios SER, bandas de aparcamiento y callejero vial, junto con la construcción del mapa base SER.
+- `02_03_ser_oferta_espacial.ipynb`: limpieza de calles/plazas, zonas SER y parquímetros.
+- `02_04_ser_presion_estructural.ipynb`: limpieza de autorizaciones SER e IVTM por barrio.
+- `02_05_contexto_calendario.ipynb`: limpieza del calendario laboral.
+- `02_06_emt_inventario.ipynb`: limpieza e integración del inventario EMT y de los aparcamientos públicos municipales.
+- `02_07_emt_historico.ipynb`: futura limpieza de los históricos de ocupación EMT.
 
 En esta fase no se construirán joins finales, `SER_barrio_intervalo`, `SER_calle_intervalo`, `inventario_global_emt`, métricas proxy ni modelos. Esos pasos quedan para fases posteriores, una vez las fuentes individuales estén limpias y validadas.
 
