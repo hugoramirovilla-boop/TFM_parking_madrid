@@ -55,4 +55,6 @@ anaconda_projects/
 reports/review/
 
 # Documentación fuente local no versionada
-docs/source_docs/
+# Documentación oficial de fuentes del TFM: versionada
+!docs/source_docs/
+!docs/source_docs/**

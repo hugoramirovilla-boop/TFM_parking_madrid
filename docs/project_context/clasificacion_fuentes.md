@@ -5,7 +5,7 @@
 ### Delimitación e inventario base
 
 - SER calles y número de plazas.
-- Zonas SER / cartografía.
+- Cartografía SER Geoportal.
 - SER parquímetros.
 - Aparcamientos EMT / parkings.csv.
 - Aparcamientos públicos municipales.
