@@ -18,6 +18,7 @@ import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import pandas as pd
 import pyproj
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from shapely.geometry import box
 
@@ -2101,6 +2102,116 @@ def _dense_points_window(
     )
 
 
+def _emt_realtime_label_offsets(
+    gdf: gpd.GeoDataFrame,
+    *,
+    ax: plt.Axes,
+    fontsize: float = 6.4,
+) -> dict[Any, tuple[int, int]]:
+    candidate_offsets = [(0, 10), (0, -10), (10, 8), (-10, 8), (10, -8), (-10, -8), (14, 0), (-14, 0)]
+    if gdf.empty:
+        return {}
+
+    placement_order = (
+        gdf.loc[~gdf.geometry.isna() & ~gdf.geometry.is_empty]
+        .assign(_label_sort_x=lambda df: df.geometry.x, _label_sort_y=lambda df: df.geometry.y)
+        .sort_values(["_label_sort_y", "_label_sort_x"], ascending=[False, True], kind="mergesort")
+        .index
+        .tolist()
+    )
+    point_to_pixel = ax.figure.dpi / 72
+    placed_boxes: list[tuple[float, float, float, float]] = []
+    selected_offsets: dict[Any, tuple[int, int]] = {}
+
+    for idx in placement_order:
+        row = gdf.loc[idx]
+        geom = row.geometry
+        label = _emt_realtime_label_text(row)
+        candidates = []
+        for offset in candidate_offsets:
+            box = _label_box_for_offset(
+                ax=ax,
+                xy=(geom.x, geom.y),
+                label=label,
+                offset=offset,
+                fontsize=fontsize,
+                point_to_pixel=point_to_pixel,
+            )
+            overlap = sum(_box_overlap_area(box, placed_box) for placed_box in placed_boxes)
+            distance = (offset[0] ** 2 + offset[1] ** 2) ** 0.5
+            candidates.append((overlap, distance, offset, box))
+        candidates.sort(key=lambda item: (item[0] > 0, item[0], item[1]))
+        _, _, offset, box = candidates[0]
+        selected_offsets[idx] = offset
+        placed_boxes.append(box)
+    return selected_offsets
+
+
+def _emt_realtime_label_text(row: Any) -> str:
+    name = _short_parking_name(getattr(row, "nombre", None))
+    free = getattr(row, "free_valid", pd.NA)
+    return f"{name}\n{int(free) if pd.notna(free) else 's/d'} libres"
+
+
+def _label_box_for_offset(
+    *,
+    ax: plt.Axes,
+    xy: tuple[float, float],
+    label: str,
+    offset: tuple[int, int],
+    fontsize: float,
+    point_to_pixel: float,
+) -> tuple[float, float, float, float]:
+    x, y = ax.transData.transform(xy)
+    x += offset[0] * point_to_pixel
+    y += offset[1] * point_to_pixel
+    lines = label.splitlines() or [label]
+    width = max(len(line) for line in lines) * fontsize * 0.58 * point_to_pixel
+    height = len(lines) * fontsize * 1.25 * point_to_pixel
+    pad = 1.5 * point_to_pixel
+    ha, va = _label_alignment_for_offset(offset)
+
+    if ha == "left":
+        x0, x1 = x, x + width
+    elif ha == "right":
+        x0, x1 = x - width, x
+    else:
+        x0, x1 = x - width / 2, x + width / 2
+
+    if va == "bottom":
+        y0, y1 = y, y + height
+    elif va == "top":
+        y0, y1 = y - height, y
+    else:
+        y0, y1 = y - height / 2, y + height / 2
+    return x0 - pad, y0 - pad, x1 + pad, y1 + pad
+
+
+def _box_overlap_area(
+    box_a: tuple[float, float, float, float],
+    box_b: tuple[float, float, float, float],
+) -> float:
+    x_overlap = max(0.0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    y_overlap = max(0.0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+    return x_overlap * y_overlap
+
+
+def _label_alignment_for_offset(offset: tuple[int, int]) -> tuple[str, str]:
+    dx, dy = offset
+    ha = "center"
+    if dx > 0:
+        ha = "left"
+    elif dx < 0:
+        ha = "right"
+
+    va = "center"
+    if dy > 0:
+        va = "bottom"
+    elif dy < 0:
+        va = "top"
+    return ha, va
+
+
 def save_emt_realtime_zoom_figure(
     layers: dict[str, gpd.GeoDataFrame],
     output_path: Path,
@@ -2156,45 +2267,56 @@ def save_emt_realtime_zoom_figure(
                     zorder=3,
                 )
 
+    plotted_categories: list[str] = []
     for category, label in EMT_REALTIME_CATEGORY_LABELS.items():
         subset = emt_zoom.loc[emt_zoom["categoria_disponibilidad_emt"].eq(category)]
         if subset.empty:
             continue
+        plotted_categories.append(category)
         subset.plot(
             ax=ax,
             color=EMT_REALTIME_CATEGORY_COLORS[category],
-            edgecolor="white",
-            linewidth=1.2,
-            markersize=95,
+            edgecolor="#111827",
+            linewidth=0.8,
+            markersize=110,
             label=label,
-            zorder=4,
+            alpha=0.98,
+            zorder=6,
         )
 
-    for row in emt_zoom.itertuples(index=False):
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+
+    label_fontsize = 6.3
+    label_offsets = _emt_realtime_label_offsets(
+        emt_zoom,
+        ax=ax,
+        fontsize=label_fontsize,
+    )
+    for row in emt_zoom.itertuples(index=True):
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
-        name = _short_parking_name(getattr(row, "nombre", None))
-        free = getattr(row, "free_valid", pd.NA)
-        label = f"{name}\n{int(free) if pd.notna(free) else 's/d'} libres"
-        text = ax.text(
-            geom.x,
-            geom.y,
+        label = _emt_realtime_label_text(row)
+        offset = label_offsets.get(row.Index, (0, 10))
+        ha, va = _label_alignment_for_offset(offset)
+        text = ax.annotate(
             label,
-            ha="center",
-            va="bottom",
-            fontsize=6.4,
+            xy=(geom.x, geom.y),
+            xytext=offset,
+            textcoords="offset points",
+            ha=ha,
+            va=va,
+            fontsize=label_fontsize,
             fontweight="bold",
             color="#111827",
             clip_on=True,
-            zorder=5,
+            zorder=7,
         )
         text.set_path_effects(
             [path_effects.Stroke(linewidth=2.1, foreground="white"), path_effects.Normal()]
         )
 
-    ax.set_xlim(minx, maxx)
-    ax.set_ylim(miny, maxy)
     ax.set_axis_off()
     query_label = scenario.get("emt_query_timestamp_label") or "consulta sin hora"
     ax.set_title(
@@ -2205,7 +2327,22 @@ def save_emt_realtime_zoom_figure(
         fontsize=13,
         pad=14,
     )
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="none",
+            markerfacecolor=EMT_REALTIME_CATEGORY_COLORS[category],
+            markeredgecolor="#111827",
+            markeredgewidth=0.8,
+            markersize=8,
+            label=EMT_REALTIME_CATEGORY_LABELS[category],
+        )
+        for category in plotted_categories
+    ]
     ax.legend(
+        handles=legend_handles,
         title="Disponibilidad EMT",
         loc="lower left",
         frameon=True,
