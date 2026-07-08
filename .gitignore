@@ -39,7 +39,6 @@ reports/figures/**
 
 reports/tables/**
 !reports/tables/
-!reports/tables/.gitkeep
 
 reports/entregable_descripcion_limpieza/**
 !reports/entregable_descripcion_limpieza/
