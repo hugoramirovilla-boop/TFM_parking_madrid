@@ -15,6 +15,7 @@ import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import pandas as pd
 import pyproj
+from matplotlib.patches import Patch
 
 try:
     import folium
@@ -73,11 +74,11 @@ COLOR_STYLE = {
     "naranja": "#f97316",
 }
 COLOR_LABEL = {
-    "azul": "azul",
-    "verde": "verde",
-    "alta_rotacion": "alta rotación",
-    "rojo": "rojo",
-    "naranja": "naranja",
+    "azul": "Azul",
+    "verde": "Verde",
+    "alta_rotacion": "Alta rotación",
+    "rojo": "Azul sanitario",
+    "naranja": "Uso disuasorio",
 }
 CHECK_STATUSES = {"OK", "WARNING", "FAIL"}
 
@@ -103,6 +104,16 @@ class SEREMTMapResult:
     checks: pd.DataFrame
     diagnostics: dict[str, pd.DataFrame]
     outputs: pd.DataFrame
+
+
+@dataclass
+class SERPredictionMapResult:
+    folium_map: Any
+    layers: dict[str, gpd.GeoDataFrame]
+    checks: pd.DataFrame
+    diagnostics: dict[str, pd.DataFrame]
+    outputs: pd.DataFrame
+    scenario: dict[str, Any]
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -476,6 +487,32 @@ def add_geojson_layer(
     return layer
 
 
+def _prepare_bandas_web(
+    bandas_map: gpd.GeoDataFrame,
+    web_simplify_m: float,
+) -> gpd.GeoDataFrame:
+    bandas_web = to_web(bandas_map, web_simplify_m)
+    bandas_web["color_label"] = bandas_web["color"].map(COLOR_LABEL).fillna(
+        bandas_web["color"].astype("string")
+    )
+    columns = ["color", "color_label"]
+    if "tipo_aparcamiento_label" in bandas_web.columns:
+        columns.append("tipo_aparcamiento_label")
+    columns.extend(["numero_plazas", "geometry"])
+    return bandas_web.loc[:, columns]
+
+
+def _bandas_tooltip_fields_aliases(gdf: gpd.GeoDataFrame) -> tuple[list[str], list[str]]:
+    fields = ["color_label"]
+    aliases = ["Modalidad SER"]
+    if "tipo_aparcamiento_label" in gdf.columns:
+        fields.append("tipo_aparcamiento_label")
+        aliases.append("Tipo de aparcamiento")
+    fields.append("numero_plazas")
+    aliases.append("Número de plazas")
+    return fields, aliases
+
+
 def add_marker_cluster(
     fmap: folium.Map,
     gdf: gpd.GeoDataFrame,
@@ -560,11 +597,8 @@ def build_ser_emt_base_map(
     limite_web = to_web(layers["limite_map"], web_simplify_m)
     barrios_web = to_web(layers["barrios_model_map"], web_simplify_m).reset_index(drop=True)
     barrios_web = barrios_web.loc[:, ["barrio", "barrio_key", "geometry"]]
-    bandas_web = to_web(layers["bandas_map"], web_simplify_m)
-    bandas_web["color_label"] = bandas_web["color"].map(COLOR_LABEL).fillna(
-        bandas_web["color"].astype("string")
-    )
-    bandas_web = bandas_web.loc[:, ["color", "color_label", "numero_plazas", "geometry"]]
+    bandas_web = _prepare_bandas_web(layers["bandas_map"], web_simplify_m)
+    bandas_fields, bandas_aliases = _bandas_tooltip_fields_aliases(bandas_web)
     callejero_web = to_web(layers["callejero_map"], web_simplify_m)
 
     center = _union_geometry(limite_web).centroid
@@ -622,10 +656,10 @@ def build_ser_emt_base_map(
             "weight": 2.4,
             "opacity": 0.9,
         },
-        tooltip_fields=["color_label", "numero_plazas"],
-        tooltip_aliases=["Color SER", "Número de plazas"],
-        popup_fields=["color_label", "numero_plazas"],
-        popup_aliases=["Color SER", "Número de plazas"],
+        tooltip_fields=bandas_fields,
+        tooltip_aliases=bandas_aliases,
+        popup_fields=bandas_fields,
+        popup_aliases=bandas_aliases,
         show=True,
     )
 
@@ -880,6 +914,866 @@ def _append_check(
             "detail": detail,
             "critical": critical,
         }
+    )
+
+
+PREDICTION_REQUIRED_COLUMNS = {
+    "barrio_key",
+    "barrio_nombre",
+    "intervalo_inicio",
+    "dia_semana_num",
+    "fallback_level",
+    "prob_aparcar_proxy",
+}
+
+PREDICTION_CATEGORY_ORDER = ["baja", "media", "alta"]
+PREDICTION_CATEGORY_LABELS = {
+    "baja": "Baja",
+    "media": "Media",
+    "alta": "Alta",
+}
+PREDICTION_CATEGORY_COLORS = {
+    "baja": "#fecaca",
+    "media": "#fef3c7",
+    "alta": "#bbf7d0",
+}
+WEEKDAY_LABELS = {
+    0: "lunes",
+    1: "martes",
+    2: "miércoles",
+    3: "jueves",
+    4: "viernes",
+    5: "sábado",
+    6: "domingo",
+}
+
+
+def _base_ser_emt_layers_and_diagnostics(
+    *,
+    root: Path,
+    target_year: int,
+    expected_model_barrios: int,
+    expected_emt_entities: int,
+    visual_buffer_m: float,
+) -> tuple[dict[str, gpd.GeoDataFrame], list[dict[str, Any]], dict[str, pd.DataFrame]]:
+    checks: list[dict[str, Any]] = []
+    diagnostics: dict[str, pd.DataFrame] = {}
+
+    ser_paths = {dataset_id: root / relative for dataset_id, relative in SER_INPUT_PATHS.items()}
+    ser_files_exist = all(path.exists() for path in ser_paths.values())
+    _append_check(
+        checks,
+        "ser_layers_exist",
+        "OK" if ser_files_exist else "FAIL",
+        "; ".join(f"{k}={relpath(v, root)}:{v.exists()}" for k, v in ser_paths.items()),
+        True,
+    )
+    layers = read_ser_map_layers(root)
+    _append_check(
+        checks,
+        "ser_layers_not_empty",
+        "OK" if all(not gdf.empty for gdf in layers.values()) else "FAIL",
+        "; ".join(f"{k}:rows={len(v)}" for k, v in layers.items()),
+        True,
+    )
+    ser_crs_ok = all(gdf.crs is not None and gdf.crs.to_epsg() == 25830 for gdf in layers.values())
+    _append_check(
+        checks,
+        "ser_crs_epsg_25830",
+        "OK" if ser_crs_ok else "FAIL",
+        "; ".join(f"{k}:epsg={v.crs.to_epsg() if v.crs else None}" for k, v in layers.items()),
+        True,
+    )
+
+    capacidad_target = _ser_capacity_target(root, target_year)
+    if capacidad_target.empty:
+        _append_check(
+            checks,
+            "ser_capacity_target_not_empty",
+            "FAIL",
+            f"target_year={target_year}",
+            True,
+        )
+
+    emt_inventory, emt_checks = read_emt_inventory_as_gdf(
+        root / EMT_INVENTORY_PATH,
+        expected_emt_entities=expected_emt_entities,
+    )
+    checks.extend(emt_checks.to_dict("records"))
+    diagnostics["emt_inventory"] = pd.DataFrame(
+        [
+            {
+                "n_rows": len(emt_inventory),
+                "n_parking_uid": (
+                    emt_inventory["parking_uid"].nunique()
+                    if "parking_uid" in emt_inventory
+                    else 0
+                ),
+                "crs_epsg": emt_inventory.crs.to_epsg() if emt_inventory.crs else None,
+            }
+        ]
+    )
+
+    barrios_model_map, barrio_diagnostics = build_model_compatible_barrios(
+        layers["ser_geoportal_barrios_ser"],
+        capacidad_target,
+        expected_model_barrios=expected_model_barrios,
+    )
+    diagnostics.update(barrio_diagnostics)
+
+    original_barrios = layers["ser_geoportal_barrios_ser"].copy()
+    original_barrios["barrio_key"] = make_barrio_key(original_barrios)
+    carto_rows_ok = len(original_barrios) == 66
+    carto_keys_ok = original_barrios["barrio_key"].nunique(dropna=True) == expected_model_barrios
+    model_rows_ok = len(barrios_model_map) == expected_model_barrios
+    model_keys = set(capacidad_target["barrio_key"].dropna().astype(str))
+    map_keys = set(barrios_model_map["barrio_key"].dropna().astype(str))
+    keys_match = model_keys == map_keys
+    dup_0904 = barrio_diagnostics["barrios_duplicate_keys"].loc[
+        lambda df: df["barrio_key"].eq("09_04")
+    ]
+    dup_0904_ok = (
+        len(dup_0904) == 1
+        and int(dup_0904.iloc[0]["n_geometrias_origen"]) == 2
+        and "Valdezarza Fase III" in str(dup_0904.iloc[0]["nombres_cartograficos"])
+    )
+
+    _append_check(checks, "barrios_original_rows_66", "OK" if carto_rows_ok else "FAIL", f"rows={len(original_barrios)}", True)
+    _append_check(checks, "barrios_original_unique_keys_65", "OK" if carto_keys_ok else "FAIL", f"unique={original_barrios['barrio_key'].nunique(dropna=True)}", True)
+    _append_check(checks, "barrios_model_map_rows_65", "OK" if model_rows_ok else "FAIL", f"rows={len(barrios_model_map)}", True)
+    _append_check(
+        checks,
+        "barrios_model_and_map_keys_match",
+        "OK" if keys_match else "FAIL",
+        f"map_not_model={sorted(map_keys - model_keys)}; model_not_map={sorted(model_keys - map_keys)}",
+        True,
+    )
+    _append_check(
+        checks,
+        "barrios_duplicate_09_04_documented",
+        "OK" if dup_0904_ok else "FAIL",
+        dup_0904.to_dict("records"),
+        True,
+    )
+
+    map_layers = prepare_ser_map_views(
+        layers,
+        barrios_model_map,
+        visual_buffer_m=visual_buffer_m,
+    )
+    limite_geom = _union_geometry(layers["ser_geoportal_limite_ser"])
+    visual_area = limite_geom.buffer(visual_buffer_m)
+    emt_map = emt_inventory.loc[
+        emt_inventory.geometry.intersects(visual_area).fillna(False)
+    ].copy()
+    n_emt_outside_visual_area = len(emt_inventory) - len(emt_map)
+    diagnostics["emt_spatial_filter"] = pd.DataFrame(
+        [
+            {
+                "n_emt_inventory_total": len(emt_inventory),
+                "n_emt_in_visual_area": len(emt_map),
+                "n_emt_outside_visual_area": n_emt_outside_visual_area,
+                "visual_buffer_m": visual_buffer_m,
+            }
+        ]
+    )
+    _append_check(
+        checks,
+        "emt_outside_visual_area",
+        "WARNING" if n_emt_outside_visual_area > 0 else "OK",
+        (
+            f"outside={n_emt_outside_visual_area}; "
+            f"in_visual_area={len(emt_map)}; inventory_total={len(emt_inventory)}"
+        ),
+        False,
+    )
+    map_layers["emt_inventory"] = emt_inventory
+    map_layers["emt_map"] = emt_map
+
+    plazas_diagnostic = _ser_plazas_diagnostic(map_layers["bandas_map"], capacidad_target)
+    diagnostics["ser_plazas"] = plazas_diagnostic
+    plazas_status = plazas_diagnostic.iloc[0]["status"]
+    _append_check(
+        checks,
+        "ser_plazas_bandas_vs_capacidad",
+        plazas_status,
+        plazas_diagnostic.iloc[0].to_dict(),
+        plazas_status == "FAIL",
+    )
+    return map_layers, checks, diagnostics
+
+
+def _prediction_category_from_pct(pct: int) -> str:
+    if pct < 30:
+        return "baja"
+    if pct < 70:
+        return "media"
+    return "alta"
+
+
+def _prepare_prediction_barrios(
+    barrios_model_map: gpd.GeoDataFrame,
+    operational: pd.DataFrame,
+    *,
+    expected_model_barrios: int = 65,
+) -> tuple[gpd.GeoDataFrame, list[dict[str, Any]], dict[str, pd.DataFrame]]:
+    checks: list[dict[str, Any]] = []
+    diagnostics: dict[str, pd.DataFrame] = {}
+
+    missing = sorted(PREDICTION_REQUIRED_COLUMNS - set(operational.columns))
+    _append_check(
+        checks,
+        "prediction_required_columns",
+        "OK" if not missing else "FAIL",
+        f"missing={missing}",
+        True,
+    )
+    _append_check(
+        checks,
+        "prediction_not_empty",
+        "OK" if not operational.empty else "FAIL",
+        f"rows={len(operational)}",
+        True,
+    )
+    if missing or operational.empty:
+        return barrios_model_map.copy(), checks, diagnostics
+
+    prediction = operational.copy()
+    prediction["barrio_key"] = prediction["barrio_key"].astype("string")
+    prediction["intervalo_inicio"] = pd.to_datetime(prediction["intervalo_inicio"], errors="coerce")
+    prediction["prob_aparcar_proxy"] = pd.to_numeric(
+        prediction["prob_aparcar_proxy"],
+        errors="coerce",
+    )
+
+    key_not_null = prediction["barrio_key"].notna().all()
+    key_unique = prediction["barrio_key"].is_unique
+    n_prediction_keys = prediction["barrio_key"].nunique(dropna=True)
+    prob_not_null = prediction["prob_aparcar_proxy"].notna().all()
+    prob_range = prediction["prob_aparcar_proxy"].between(0, 1, inclusive="both").all()
+    single_interval = prediction["intervalo_inicio"].nunique(dropna=True) == 1
+
+    _append_check(checks, "prediction_barrio_key_not_null", "OK" if key_not_null else "FAIL", f"nulls={int(prediction['barrio_key'].isna().sum())}", True)
+    _append_check(checks, "prediction_unique_barrio_key", "OK" if key_unique else "FAIL", f"duplicates={int(prediction['barrio_key'].duplicated().sum())}", True)
+    _append_check(checks, "prediction_expected_barrios", "OK" if n_prediction_keys == expected_model_barrios else "FAIL", f"barrios={n_prediction_keys}; expected={expected_model_barrios}", True)
+    _append_check(checks, "prediction_prob_not_null", "OK" if prob_not_null else "FAIL", f"nulls={int(prediction['prob_aparcar_proxy'].isna().sum())}", True)
+    _append_check(checks, "prediction_prob_range_0_1", "OK" if prob_range else "FAIL", f"min={prediction['prob_aparcar_proxy'].min()}; max={prediction['prob_aparcar_proxy'].max()}", True)
+    _append_check(checks, "prediction_single_interval", "OK" if single_interval else "FAIL", f"intervals={prediction['intervalo_inicio'].dropna().astype(str).unique().tolist()}", True)
+
+    pred_cols = [
+        "barrio_key",
+        "barrio_nombre",
+        "intervalo_inicio",
+        "dia_semana_num",
+        "fallback_level",
+        "prob_aparcar_proxy",
+    ]
+    prediction = prediction.loc[:, pred_cols].copy()
+
+    barrios = barrios_model_map.copy()
+    barrios["barrio_key"] = barrios["barrio_key"].astype("string")
+    prediction_keys = set(prediction["barrio_key"].dropna().astype(str))
+    map_keys = set(barrios["barrio_key"].dropna().astype(str))
+    map_not_prediction = sorted(map_keys - prediction_keys)
+    prediction_not_map = sorted(prediction_keys - map_keys)
+
+    prediction_layer = barrios.merge(
+        prediction,
+        on="barrio_key",
+        how="left",
+        validate="one_to_one",
+    )
+    missing_after_join = int(prediction_layer["prob_aparcar_proxy"].isna().sum())
+    join_ok = missing_after_join == 0 and not map_not_prediction and not prediction_not_map
+    _append_check(
+        checks,
+        "prediction_join_all_barrios",
+        "OK" if join_ok else "FAIL",
+        (
+            f"missing_after_join={missing_after_join}; "
+            f"map_not_prediction={map_not_prediction}; prediction_not_map={prediction_not_map}"
+        ),
+        True,
+    )
+    _append_check(
+        checks,
+        "prediction_no_missing_map_keys",
+        "OK" if not map_not_prediction else "FAIL",
+        f"map_not_prediction={map_not_prediction}",
+        True,
+    )
+
+    pct = (prediction_layer["prob_aparcar_proxy"] * 100).round().astype("Int64")
+    prediction_layer["prob_aparcar_proxy_pct"] = pct
+    prediction_layer["prob_aparcar_proxy_label"] = pct.astype("string") + "%"
+    prediction_layer["categoria_prob_aparcar"] = pct.astype("int64").map(_prediction_category_from_pct)
+    prediction_layer["categoria_prob_aparcar_label"] = prediction_layer[
+        "categoria_prob_aparcar"
+    ].map(PREDICTION_CATEGORY_LABELS)
+    prediction_layer["fill_color"] = prediction_layer["categoria_prob_aparcar"].map(
+        PREDICTION_CATEGORY_COLORS
+    )
+    prediction_layer["barrio"] = prediction_layer["barrio_nombre"].fillna(
+        prediction_layer["barrio"]
+    )
+
+    diagnostics["prediction_join"] = pd.DataFrame(
+        [
+            {
+                "n_barrios_mapa": len(barrios),
+                "n_barrios_operational": len(prediction),
+                "n_barrios_join": len(prediction_layer),
+                "missing_after_join": missing_after_join,
+                "map_not_prediction": ", ".join(map_not_prediction),
+                "prediction_not_map": ", ".join(prediction_not_map),
+            }
+        ]
+    )
+    diagnostics["prediction_categories"] = (
+        prediction_layer.groupby(
+            ["categoria_prob_aparcar", "categoria_prob_aparcar_label"],
+            dropna=False,
+        )
+        .size()
+        .reindex(
+            pd.MultiIndex.from_tuples(
+                [(key, PREDICTION_CATEGORY_LABELS[key]) for key in PREDICTION_CATEGORY_ORDER],
+                names=["categoria_prob_aparcar", "categoria_prob_aparcar_label"],
+            ),
+            fill_value=0,
+        )
+        .reset_index(name="n_barrios")
+    )
+    q = prediction_layer["prob_aparcar_proxy"].quantile([0, 0.25, 0.5, 0.75, 1])
+    diagnostics["prediction_distribution"] = pd.DataFrame(
+        [
+            {
+                "n": int(prediction_layer["prob_aparcar_proxy"].count()),
+                "min": q.loc[0],
+                "p25": q.loc[0.25],
+                "mean": prediction_layer["prob_aparcar_proxy"].mean(),
+                "p50": q.loc[0.5],
+                "p75": q.loc[0.75],
+                "max": q.loc[1],
+            }
+        ]
+    )
+    return prediction_layer, checks, diagnostics
+
+
+def _scenario_from_operational(
+    operational: pd.DataFrame,
+    scenario_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = scenario_metadata or {}
+    interval_start = pd.Timestamp(
+        metadata.get("intervalo_inicio")
+        or operational["intervalo_inicio"].dropna().iloc[0]
+    )
+    interval_end_value = metadata.get("intervalo_fin")
+    interval_end = (
+        pd.Timestamp(interval_end_value)
+        if interval_end_value is not None
+        else interval_start + pd.Timedelta(minutes=30)
+    )
+    requested_value = metadata.get("scenario_datetime_requested")
+    requested = pd.Timestamp(requested_value) if requested_value is not None else pd.NaT
+    weekday_value = metadata.get("dia_semana_num_m0")
+    if weekday_value is None and "dia_semana_num" in operational:
+        weekday_value = operational["dia_semana_num"].dropna().iloc[0]
+    weekday_num = int(weekday_value) if weekday_value is not None and pd.notna(weekday_value) else None
+    weekday_label = WEEKDAY_LABELS.get(weekday_num, pd.NA)
+    return {
+        "fecha": interval_start.date().isoformat(),
+        "fecha_label": interval_start.strftime("%d/%m/%Y"),
+        "hora_solicitada": (
+            requested.strftime("%H:%M") if pd.notna(requested) else None
+        ),
+        "intervalo_inicio": interval_start,
+        "intervalo_fin": interval_end,
+        "intervalo_label": f"{interval_start.strftime('%H:%M')}–{interval_end.strftime('%H:%M')}",
+        "dia_semana_num": weekday_num,
+        "dia_semana": weekday_label,
+        "nota": "Escala proxy relativa, no probabilidad observada de encontrar plaza.",
+    }
+
+
+def _add_prediction_labels(
+    fmap: folium.Map,
+    prediction_layer: gpd.GeoDataFrame,
+) -> folium.FeatureGroup:
+    group = folium.FeatureGroup(name="Etiquetas prob. aparcar proxy", show=True)
+    label_gdf = prediction_layer.to_crs(WEB_CRS).copy()
+    for row in label_gdf.itertuples(index=False):
+        geom = row.geometry
+        label = getattr(row, "prob_aparcar_proxy_label", None)
+        if geom is None or geom.is_empty or pd.isna(label):
+            continue
+        point = geom.representative_point()
+        html = f"""
+        <div style="
+            font-family: Arial, sans-serif;
+            font-weight: 700;
+            font-size: 11px;
+            color: #111827;
+            text-shadow: -1px -1px 0 #ffffff, 1px -1px 0 #ffffff,
+                         -1px 1px 0 #ffffff, 1px 1px 0 #ffffff;
+            white-space: nowrap;
+            transform: translate(-50%, -50%);
+        ">{escape(str(label))}</div>
+        """
+        folium.Marker(
+            location=[point.y, point.x],
+            icon=folium.DivIcon(html=html, icon_size=(1, 1), icon_anchor=(0, 0)),
+            interactive=False,
+        ).add_to(group)
+    group.add_to(fmap)
+    return group
+
+
+def _add_prediction_map_controls(fmap: folium.Map, scenario: dict[str, Any]) -> None:
+    hora_solicitada = scenario.get("hora_solicitada")
+    hora_line = (
+        f"<div><b>Hora solicitada:</b> {escape(str(hora_solicitada))}</div>"
+        if hora_solicitada
+        else ""
+    )
+    scenario_html = f"""
+    <div style="
+        position: fixed;
+        top: 74px;
+        left: 10px;
+        right: auto;
+        z-index: 9999;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        color: #111827;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+        max-width: 280px;
+        pointer-events: none;
+    ">
+        <div style="font-weight:700; margin-bottom:6px;">Escenario SER — facilidad proxy de aparcamiento</div>
+        <div><b>Fecha:</b> {escape(str(scenario.get("fecha_label", "")))}</div>
+        {hora_line}
+        <div><b>Intervalo usado:</b> {escape(str(scenario.get("intervalo_label", "")))}</div>
+        <div><b>Día:</b> {escape(str(scenario.get("dia_semana", "")))}</div>
+        <div style="margin-top:6px;"><b>Nota:</b> escala proxy relativa, no probabilidad observada.</div>
+    </div>
+    """
+    search_css = """
+    <style>
+        .leaflet-control-search {
+            margin-top: 180px !important;
+        }
+    </style>
+    """
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 28px;
+        right: 14px;
+        z-index: 9999;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        color: #111827;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    ">
+        <div style="font-weight:700; margin-bottom:6px;">Facilidad proxy SER</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fecaca;border:1px solid #9ca3af;margin-right:6px;"></span>Baja: 0–29%</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fef3c7;border:1px solid #9ca3af;margin-right:6px;"></span>Media: 30–69%</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#bbf7d0;border:1px solid #9ca3af;margin-right:6px;"></span>Alta: 70–100%</div>
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(search_css))
+    fmap.get_root().html.add_child(folium.Element(scenario_html))
+    fmap.get_root().html.add_child(folium.Element(legend_html))
+
+
+def build_ser_prediction_base_map(
+    layers: dict[str, gpd.GeoDataFrame],
+    scenario: dict[str, Any],
+    *,
+    web_simplify_m: float = 0.5,
+) -> folium.Map:
+    limite_web = to_web(layers["limite_map"], web_simplify_m)
+    prediction_web = to_web(layers["prediction_barrios"], web_simplify_m).reset_index(drop=True)
+    prediction_web = prediction_web.loc[
+        :,
+        [
+            "barrio",
+            "barrio_key",
+            "prob_aparcar_proxy_label",
+            "categoria_prob_aparcar_label",
+            "fill_color",
+            "geometry",
+        ],
+    ]
+    barrios_web = to_web(layers["barrios_model_map"], web_simplify_m).reset_index(drop=True)
+    barrios_web = barrios_web.loc[:, ["barrio", "barrio_key", "geometry"]]
+    bandas_web = _prepare_bandas_web(layers["bandas_map"], web_simplify_m)
+    bandas_fields, bandas_aliases = _bandas_tooltip_fields_aliases(bandas_web)
+    callejero_web = to_web(layers["callejero_map"], web_simplify_m)
+
+    center = _union_geometry(limite_web).centroid
+    fmap = folium.Map(
+        location=[center.y, center.x],
+        zoom_start=13,
+        tiles="CartoDB Positron",
+        control_scale=True,
+    )
+    callejero_layer = add_geojson_layer(
+        fmap,
+        callejero_web,
+        "Callejero propio/viales vigentes",
+        lambda feature: {
+            "color": "#6b7280",
+            "weight": 0.25,
+            "fillColor": "#9ca3af",
+            "fillOpacity": 0.05,
+            "opacity": 0.35,
+        },
+        tooltip_fields=["top_id", "nombre_via_completo"],
+        show=False,
+    )
+    Search(
+        layer=callejero_layer,
+        geom_type="Polygon",
+        search_label="nombre_via_completo",
+        placeholder="Buscar calle...",
+        collapsed=False,
+    ).add_to(fmap)
+
+    add_geojson_layer(
+        fmap,
+        prediction_web,
+        "Barrios SER predicción proxy",
+        lambda feature: {
+            "color": "#374151",
+            "weight": 0.55,
+            "fillColor": feature["properties"].get("fill_color", "#f3f4f6"),
+            "fillOpacity": 0.52,
+            "opacity": 0.65,
+        },
+        tooltip_fields=[
+            "barrio",
+            "barrio_key",
+            "prob_aparcar_proxy_label",
+            "categoria_prob_aparcar_label",
+        ],
+        tooltip_aliases=[
+            "Barrio",
+            "Código barrio",
+            "Prob. aparcar proxy",
+            "Categoría",
+        ],
+        popup_fields=[
+            "barrio",
+            "barrio_key",
+            "prob_aparcar_proxy_label",
+            "categoria_prob_aparcar_label",
+        ],
+        popup_aliases=[
+            "Barrio",
+            "Código barrio",
+            "Prob. aparcar proxy",
+            "Categoría",
+        ],
+        show=True,
+    )
+    add_geojson_layer(
+        fmap,
+        barrios_web,
+        "Barrios SER modelo — límites",
+        lambda feature: {"color": "#374151", "weight": 1.1, "fillOpacity": 0, "opacity": 0.85},
+        show=True,
+        interactive=False,
+    )
+    add_geojson_layer(
+        fmap,
+        limite_web,
+        "Límite SER",
+        lambda feature: {"color": "#000000", "weight": 2.5, "fillOpacity": 0},
+        show=True,
+        interactive=False,
+    )
+    add_geojson_layer(
+        fmap,
+        bandas_web,
+        "Bandas SER",
+        lambda feature: {
+            "color": COLOR_STYLE.get(feature["properties"].get("color"), "#4b5563"),
+            "weight": 2.4,
+            "opacity": 0.9,
+        },
+        tooltip_fields=bandas_fields,
+        tooltip_aliases=bandas_aliases,
+        popup_fields=bandas_fields,
+        popup_aliases=bandas_aliases,
+        show=True,
+    )
+
+    parq_icon_html = """
+    <div style="
+        width: 16px; height: 16px; border-radius: 50%;
+        background: #2563eb; color: white; border: 1px solid white;
+        box-shadow: 0 0 2px rgba(0,0,0,.45);
+        font-size: 10px; font-weight: 700; line-height: 16px;
+        text-align: center; font-family: Arial, sans-serif;">P</div>
+    """
+    add_marker_cluster(
+        fmap,
+        layers["parquimetros_map"],
+        name="Parquímetros SER",
+        icon_html=parq_icon_html,
+        icon_size=(16, 16),
+        icon_anchor=(8, 8),
+        show=False,
+        tooltip_default="Parquímetro SER",
+    )
+
+    emt_icon_html = """
+    <div style="
+        width: 18px; height: 18px; border-radius: 3px;
+        background: #7e22ce; color: white; border: 1px solid white;
+        box-shadow: 0 0 2px rgba(0,0,0,.45);
+        font-size: 10px; font-weight: 700; line-height: 18px;
+        text-align: center; font-family: Arial, sans-serif;">E</div>
+    """
+    add_marker_cluster(
+        fmap,
+        layers["emt_map"],
+        name="Aparcamientos EMT/off-street",
+        icon_html=emt_icon_html,
+        icon_size=(18, 18),
+        icon_anchor=(9, 9),
+        show=True,
+        tooltip_builder=_build_emt_tooltip,
+    )
+    _add_prediction_labels(fmap, layers["prediction_barrios"])
+    _add_prediction_map_controls(fmap, scenario)
+    bounds = limite_web.total_bounds
+    fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    return fmap
+
+
+def save_ser_prediction_static_figure(
+    layers: dict[str, gpd.GeoDataFrame],
+    output_path: Path,
+    scenario: dict[str, Any],
+    *,
+    visual_buffer_m: float = 25,
+) -> Path:
+    limite_geom = _union_geometry(layers["limite_map"])
+    visual_area = limite_geom.buffer(visual_buffer_m)
+    fig, ax = plt.subplots(figsize=(14, 14))
+    layers["callejero_map"].plot(
+        ax=ax,
+        color="#f8fafc",
+        edgecolor="#d1d5db",
+        linewidth=0.10,
+        alpha=0.85,
+        zorder=1,
+    )
+    for category in PREDICTION_CATEGORY_ORDER:
+        subset = layers["prediction_barrios"].loc[
+            layers["prediction_barrios"]["categoria_prob_aparcar"].eq(category)
+        ]
+        if subset.empty:
+            continue
+        subset.plot(
+            ax=ax,
+            color=PREDICTION_CATEGORY_COLORS[category],
+            edgecolor="#374151",
+            linewidth=0.45,
+            alpha=0.85,
+            label=f"{PREDICTION_CATEGORY_LABELS[category]}",
+            zorder=2,
+        )
+    layers["barrios_model_map"].boundary.plot(
+        ax=ax, color="#374151", linewidth=0.50, alpha=0.9, zorder=3
+    )
+    layers["limite_map"].boundary.plot(
+        ax=ax, color="#000000", linewidth=1.45, label="límite SER", zorder=4
+    )
+    for row in layers["prediction_barrios"].itertuples(index=False):
+        geom = row.geometry
+        pct_label = getattr(row, "prob_aparcar_proxy_label", None)
+        barrio_name = getattr(row, "barrio", None)
+        if geom is None or geom.is_empty or pd.isna(pct_label) or pd.isna(barrio_name):
+            continue
+        name_lines = wrap(str(barrio_name).title(), width=12, max_lines=2)
+        label = "\n".join([*name_lines, str(pct_label)])
+        point = geom.representative_point()
+        text = ax.text(
+            point.x,
+            point.y,
+            label,
+            ha="center",
+            va="center",
+            fontsize=5.0,
+            fontweight="bold",
+            color="#111827",
+            zorder=5,
+        )
+        text.set_path_effects(
+            [path_effects.Stroke(linewidth=1.8, foreground="white"), path_effects.Normal()]
+        )
+    _set_extent(ax, visual_area)
+    ax.set_title(
+        (
+            "Facilidad proxy SER por barrio "
+            f"({scenario.get('fecha_label')} {scenario.get('intervalo_label')})\n"
+            "Escala proxy relativa; no probabilidad observada de encontrar plaza."
+        ),
+        fontsize=13,
+        pad=16,
+    )
+    legend_handles = [
+        Patch(
+            facecolor=PREDICTION_CATEGORY_COLORS[key],
+            edgecolor="#374151",
+            label=f"{PREDICTION_CATEGORY_LABELS[key]}",
+        )
+        for key in PREDICTION_CATEGORY_ORDER
+    ]
+    ax.legend(
+        handles=legend_handles,
+        title="Facilidad proxy SER",
+        loc="lower left",
+        frameon=True,
+        framealpha=0.92,
+        fontsize=8,
+        title_fontsize=9,
+    )
+    return _save_figure(fig, output_path)
+
+
+def build_ser_prediction_map_from_operational(
+    *,
+    operational: pd.DataFrame,
+    scenario_metadata: dict[str, Any] | None = None,
+    root: Path | None = None,
+    target_year: int = 2026,
+    expected_model_barrios: int = 65,
+    expected_emt_entities: int = 85,
+    visual_buffer_m: float = 25,
+    web_simplify_m: float = 0.5,
+    html_output_path: Path | None = None,
+    png_output_path: Path | None = None,
+) -> SERPredictionMapResult:
+    root = (root or find_repo_root()).resolve()
+    layers, checks, diagnostics = _base_ser_emt_layers_and_diagnostics(
+        root=root,
+        target_year=target_year,
+        expected_model_barrios=expected_model_barrios,
+        expected_emt_entities=expected_emt_entities,
+        visual_buffer_m=visual_buffer_m,
+    )
+    prediction_barrios, prediction_checks, prediction_diagnostics = _prepare_prediction_barrios(
+        layers["barrios_model_map"],
+        operational,
+        expected_model_barrios=expected_model_barrios,
+    )
+    checks.extend(prediction_checks)
+    diagnostics.update(prediction_diagnostics)
+    preliminary_checks_df = pd.DataFrame(
+        checks,
+        columns=["check_id", "status", "detail", "critical"],
+    )
+    preliminary_failing = preliminary_checks_df.loc[
+        preliminary_checks_df["critical"].eq(True)
+        & preliminary_checks_df["status"].eq("FAIL")
+    ]
+    if not preliminary_failing.empty:
+        detail = "; ".join(
+            f"{row.check_id}: {row.detail}"
+            for row in preliminary_failing.itertuples(index=False)
+        )
+        raise ValueError(f"Critical checks failed: {detail}")
+
+    scenario = _scenario_from_operational(operational, scenario_metadata)
+    diagnostics["scenario"] = pd.DataFrame([scenario])
+    layers["prediction_barrios"] = prediction_barrios
+
+    checks_df = pd.DataFrame(checks, columns=["check_id", "status", "detail", "critical"])
+    failing_critical = checks_df.loc[checks_df["critical"].eq(True) & checks_df["status"].eq("FAIL")]
+    if not failing_critical.empty:
+        detail = "; ".join(
+            f"{row.check_id}: {row.detail}" for row in failing_critical.itertuples(index=False)
+        )
+        raise ValueError(f"Critical checks failed: {detail}")
+
+    fmap = build_ser_prediction_base_map(
+        layers,
+        scenario,
+        web_simplify_m=web_simplify_m,
+    )
+
+    outputs_rows: list[dict[str, Any]] = []
+    if html_output_path is not None:
+        html_output_path = root / html_output_path if not html_output_path.is_absolute() else html_output_path
+        html_output_path.parent.mkdir(parents=True, exist_ok=True)
+        fmap.save(html_output_path)
+        outputs_rows.append(
+            {"output": "html_prediccion_proxy", "path": relpath(html_output_path, root)}
+        )
+        _append_check(
+            checks,
+            "html_prediction_generated",
+            "OK" if html_output_path.exists() else "FAIL",
+            relpath(html_output_path, root),
+            True,
+        )
+    if png_output_path is not None:
+        png_output_path = root / png_output_path if not png_output_path.is_absolute() else png_output_path
+        save_ser_prediction_static_figure(
+            layers,
+            png_output_path,
+            scenario,
+            visual_buffer_m=visual_buffer_m,
+        )
+        outputs_rows.append(
+            {"output": "png_prediccion_proxy", "path": relpath(png_output_path, root)}
+        )
+        _append_check(
+            checks,
+            "png_prediction_generated",
+            "OK" if png_output_path.exists() else "FAIL",
+            relpath(png_output_path, root),
+            True,
+        )
+
+    checks_df = pd.DataFrame(checks, columns=["check_id", "status", "detail", "critical"])
+    failing_critical = checks_df.loc[checks_df["critical"].eq(True) & checks_df["status"].eq("FAIL")]
+    if not failing_critical.empty:
+        detail = "; ".join(
+            f"{row.check_id}: {row.detail}" for row in failing_critical.itertuples(index=False)
+        )
+        raise ValueError(f"Critical checks failed: {detail}")
+
+    outputs = pd.DataFrame(outputs_rows, columns=["output", "path"])
+    if not outputs.empty:
+        outputs["exists"] = outputs["path"].map(lambda p: (root / p).exists())
+        outputs["size_mb"] = outputs["path"].map(
+            lambda p: round((root / p).stat().st_size / 1024**2, 3) if (root / p).exists() else pd.NA
+        )
+
+    return SERPredictionMapResult(
+        folium_map=fmap,
+        layers=layers,
+        checks=checks_df,
+        diagnostics=diagnostics,
+        outputs=outputs,
+        scenario=scenario,
     )
 
 
