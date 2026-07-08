@@ -2,58 +2,117 @@
 
 Repositorio del Trabajo Fin de Máster sobre el **modelado de la dificultad de aparcar en Madrid** a partir de datos abiertos de estacionamiento regulado en superficie, aparcamientos EMT/off-street, contexto urbano y cartografía.
 
-El objetivo del proyecto es construir un **pipeline reproducible de datos, análisis y salidas cartográficas**. No se plantea como una aplicación final, sino como una base metodológica para integrar fuentes heterogéneas, evaluar su calidad y producir evidencias trazables sobre dificultad de aparcamiento.
+El objetivo del proyecto es construir un **pipeline reproducible de datos, análisis, proxies operativos y salidas cartográficas**. El repositorio no se presenta como producto software final, sino como una base metodológica trazable para integrar fuentes heterogéneas, evaluar su calidad y producir evidencias sobre dificultad de aparcamiento.
 
 ## Arquitectura conceptual
 
-El proyecto separa las fuentes según su papel analítico:
+El proyecto mantiene separadas las fuentes según su papel analítico:
 
-- **SER** es el núcleo principal. La dificultad de aparcar en superficie no se observa directamente, por lo que se aproxima mediante una variable proxy construida desde demanda pagada, capacidad física, régimen temporal y presión estructural.
-- **EMT/off-street** es una capa complementaria observable. Aporta inventario y, si se desarrolla posteriormente, series de ocupación de aparcamientos fuera de superficie.
-- **Contexto** entra solo si aporta señal, cobertura y calidad suficiente. Clima, tráfico, incidencias y afecciones no son core automático.
-- **Cartografía** es la salida común: las capas SER, EMT y contextuales deben poder representarse espacialmente y conservar trazabilidad.
+- **SER** es el núcleo principal. La dificultad de aparcar en superficie no se observa directamente, por lo que se aproxima mediante proxies construidos desde demanda pagada, capacidad física, régimen temporal y presión estructural.
+- **EMT/off-street** es una capa complementaria observable. Aporta inventario integrado de aparcamientos y una fuente viva parcial de plazas libres informadas cuando la API devuelve dato usable.
+- **Cartografía** es la salida común. Las capas SER y EMT se integran principalmente en mapas, conservando la trazabilidad de cada fuente.
+- **Contexto** se incorpora solo cuando aporta señal, cobertura y calidad suficiente. En el estado actual, el calendario laboral apoya la lectura temporal SER.
 
-No se fuerza un único modelo SER + EMT. SER y EMT miden fenómenos distintos y deben combinarse con cautela, principalmente mediante lectura espacial, temporal y cartográfica.
+No se fuerza un único modelo que mezcle SER y EMT. SER y EMT miden fenómenos distintos y se combinan con cautela mediante lectura espacial, temporal y cartográfica. El proyecto no observa ocupación SER plaza por plaza; construye proxies reproducibles y explícitos.
 
-## Estado actual del enfoque SER
+## Estado SER
 
-La salida robusta inicial prevista para el bloque SER es `SER_barrio_intervalo` / `SER_barrio_hora`, no una salida fina por calle como producto principal. El notebook `04_01_ser_joins_base.ipynb` prepara la base SER a escala barrio y genera la capacidad anual por barrio. En el árbol actual existen:
+El bloque SER ya contiene las piezas principales del flujo histórico y operativo:
 
-- `data/processed/core/ser/ser_tiques_barrio_base/`
-- `data/processed/core/ser/ser_barrio_capacidad_anio.parquet`
+- `02_01_ser_tiques.ipynb`: limpieza de tiques SER.
+- `02_02_cartografia_ser.ipynb`: cartografía limpia SER.
+- `02_03_ser_oferta_espacial.ipynb`: oferta espacial SER, centrada en `ser_calles_plazas` y `ser_parquimetros`.
+- `02_04_ser_presion_estructural.ipynb`: presión estructural a partir de autorizaciones SER e IVTM.
+- `02_05_contexto_calendario.ipynb`: calendario laboral.
+- `04_01_ser_joins_base.ipynb`: base SER depurada a escala barrio.
+- `04_02_ser_panel_barrio_intervalo.ipynb`: panel SER barrio-intervalo y selección de granularidad final de 30 minutos.
+- `04_03_ser_model_dataset_baseline.ipynb`: dataset de modelado y baseline histórico `M0_historical_profile`.
+- `04_04_ser_prediccion_prob_aparcar_proxy.ipynb`: predicción operativa de `prob_aparcar_proxy`.
 
-El panel final `SER_barrio_intervalo` todavía no está cerrado. La escala calle/parquímetro queda como análisis complementario parcial, aplicable solo a tiques con identificador físico suficiente. Los pagos digitales o de aplicación móvil no deben imputarse a parquímetro, calle o tramo si la fuente pública no permite esa localización.
+La unidad principal es **barrio x intervalo temporal**. El target histórico principal es `ocupacion_pagada_proxy`, calculado como señal de presión pagada sobre capacidad-tiempo del barrio. Esta variable no mide ocupación total del estacionamiento regulado: mide intensidad de uso pagado observada en los tiques disponibles.
 
-## Cartografía SER
+El modelo `M0_historical_profile` actúa como baseline operativo reutilizable. Se conserva como perfiles históricos y metadatos en `data/processed/core/ser/modeling/`, y se usa como base conservadora para escenarios cartográficos.
 
-La cartografía SER limpia procede de `02_02_cartografia_ser.ipynb` y se apoya en:
+La salida `prob_aparcar_proxy` es una escala proxy relativa de facilidad, derivada de la lectura inversa de un índice ajustado de dificultad SER. No debe leerse como una probabilidad observada de encontrar plaza.
 
-- `ser_geoportal_limite_ser`
-- `ser_geoportal_barrios_ser`
-- `ser_geoportal_bandas_aparcamiento`
-- `callejero_viales_vigentes`
+La escala calle/parquímetro queda como análisis complementario parcial, no como producto principal. Los pagos app/digitales no se imputan a parquímetro, calle o tramo cuando la fuente pública no permite esa localización.
 
-El notebook `02_03_ser_oferta_espacial.ipynb` queda centrado en las fuentes tabulares y puntuales de oferta SER:
+## Estado EMT/off-street
 
-- `ser_calles_plazas`
-- `ser_parquimetros`
+El bloque EMT/off-street ya contiene:
 
-El notebook `03_01_mapa_ser_cartografia.ipynb` usa estas capas para generar mapas y controles visuales del ámbito SER.
+- `02_06_emt_inventario.ipynb`: inventario integrado EMT/municipal.
+- `02_07_emt_tiempo_real.ipynb`: fuente viva parcial EMT tiempo real.
+- `src/data/emt_realtime.py`: módulo reusable para consultar, normalizar y unir la respuesta viva con el inventario.
 
-## Estado actual EMT
+El inventario integrado se guarda en `data/processed/core/emt/inventario_global_emt.parquet`. Actúa como capa cartográfica off-street y tabla de referencia para joins con identificadores EMT.
 
-El notebook `02_06_emt_inventario.ipynb` construye el inventario integrado `inventario_global_emt`, disponible en:
+EMT tiempo real se consulta mediante API SOAP manual. Es una capa viva parcial, no un modelo ni una previsión. No tiene cobertura completa de todos los aparcamientos, y la ausencia de dato vivo no implica aparcamiento lleno ni vacío.
 
-- `data/processed/core/emt/inventario_global_emt.parquet`
-- `data/processed/core/emt/parking_id_map.parquet`
+En la normalización:
 
-EMT se trata como capa off-street complementaria. El repositorio contiene fuentes raw de ocupación horaria y mensual, pero el README no asume que exista ya una previsión EMT ni una integración operativa de API en tiempo real.
+- `free_valid` representa plazas libres informadas por la API cuando el dato es usable.
+- `free_raw < 0` no se interpreta como plazas libres efectivas.
 
-## Contexto
+## Mapas y visualización
 
-El notebook `02_05_contexto_calendario.ipynb` limpia el calendario laboral y genera una tabla diaria auxiliar. Su informe interpretativo se muestra en pantalla durante la ejecución del notebook; no se mantiene como documento de limpieza independiente. El calendario sirve para validar regímenes temporales y días comparables, pero no mide aparcamiento ni ocupación.
+El bloque cartográfico ya incluye:
 
-Otras fuentes de contexto solo deben incorporarse si superan criterios de calidad, cobertura temporal y utilidad analítica para el target SER o para la lectura cartográfica.
+- `03_01_mapa_ser_cartografia.ipynb`: mapa cartográfico SER.
+- `03_02_mapa_ser_emt_integrado.ipynb`: mapa integrado SER + EMT/off-street.
+- `03_03_mapa_ser_prediccion_proxy.ipynb`: mapa SER + EMT con capa `prob_aparcar_proxy`.
+- `03_04_mapa_ser_emt_tiempo_real_proxy.ipynb`: mapa integrado SER proxy + EMT tiempo real.
+- `03_05_orquestacion_mapa_operativo.ipynb`: ejecución orquestada del mapa operativo integrado.
+
+Salidas principales conocidas:
+
+- `reports/maps/mapa_ser_cartografia.html`
+- `reports/maps/mapa_ser_emt_integrado.html`
+- `reports/maps/mapa_ser_emt_prediccion_proxy.html`
+- `reports/maps/mapa_integrado_ser_proxy_emt_tiempo_real.html`
+- `reports/figures/ser_cartografia/`
+- `reports/figures/ser_emt_integrado/`
+- `reports/figures/ser_prediccion_proxy/`
+- `reports/figures/emt_tiempo_real/`
+
+Estas salidas integran capas con naturalezas distintas. La integración SER + EMT es cartográfica: SER aporta proxy por barrio e intervalo; EMT aporta inventario off-street y, cuando está disponible, plazas libres informadas en vivo.
+
+## Código reusable
+
+Módulos principales reutilizables:
+
+- `src/models/ser_historical_baseline.py`: carga, validación y uso de perfiles históricos `M0_historical_profile`.
+- `src/models/ser_parking_proxy.py`: construcción de `prob_aparcar_proxy` SER para escenarios operativos.
+- `src/data/emt_realtime.py`: consulta SOAP, parseo, normalización y join de EMT tiempo real.
+- `src/visualization/parking_map.py`: construcción de mapas SER, SER + EMT y SER proxy + EMT tiempo real.
+- `src/pipelines/operational_map.py`: orquestación del flujo final SER proxy + EMT tiempo real + mapa integrado.
+
+`src/pipelines/operational_map.py` coordina el flujo final:
+
+- calcula el proxy SER para la hora solicitada;
+- consulta EMT tiempo real en vivo;
+- genera el mapa integrado;
+- permite activar o desactivar la escritura de outputs.
+
+Ejemplo mínimo con escritura de outputs:
+
+```python
+from src.pipelines.operational_map import build_operational_ser_emt_realtime_map
+
+result = build_operational_ser_emt_realtime_map(
+    scenario_datetime=None,
+    write_outputs=True,
+)
+```
+
+Ejemplo sin escribir outputs:
+
+```python
+result = build_operational_ser_emt_realtime_map(
+    scenario_datetime=None,
+    write_outputs=False,
+)
+```
 
 ## Estructura del repositorio
 
@@ -62,8 +121,8 @@ Otras fuentes de contexto solo deben incorporarse si superan criterios de calida
 - `data/processed/`: salidas analíticas preparadas para joins, modelado o visualización.
 - `docs/`: decisiones metodológicas y documentación técnica viva.
 - `docs/source_docs/`: documentos fuente usados como evidencia interna.
-- `notebooks/`: notebooks activos de limpieza, integración, diagnóstico y mapas.
-- `src/`: código auxiliar del proyecto, incluyendo scripts reutilizables.
+- `notebooks/`: notebooks activos de limpieza, integración, diagnóstico, modelado y mapas.
+- `src/`: código reusable del proyecto.
 - `reports/`: tablas, figuras, mapas y revisiones generadas durante el trabajo.
 
 ## Notebooks activos
@@ -74,23 +133,34 @@ Otras fuentes de contexto solo deben incorporarse si superan criterios de calida
 - `02_04_ser_presion_estructural.ipynb`
 - `02_05_contexto_calendario.ipynb`
 - `02_06_emt_inventario.ipynb`
+- `02_07_emt_tiempo_real.ipynb`
 - `03_01_mapa_ser_cartografia.ipynb`
+- `03_02_mapa_ser_emt_integrado.ipynb`
+- `03_03_mapa_ser_prediccion_proxy.ipynb`
+- `03_04_mapa_ser_emt_tiempo_real_proxy.ipynb`
+- `03_05_orquestacion_mapa_operativo.ipynb`
 - `04_01_ser_joins_base.ipynb`
+- `04_02_ser_panel_barrio_intervalo.ipynb`
+- `04_03_ser_model_dataset_baseline.ipynb`
+- `04_04_ser_prediccion_prob_aparcar_proxy.ipynb`
 
 ## Outputs principales actuales
 
-Outputs SER y cartografía confirmados en el árbol actual:
+Outputs SER, EMT y cartografía confirmados:
 
-- base SER depurada a escala barrio, particionada, en `data/processed/core/ser/ser_tiques_barrio_base/`;
+- base SER depurada a escala barrio en `data/processed/core/ser/ser_tiques_barrio_base/`;
 - capacidad anual SER por barrio en `data/processed/core/ser/ser_barrio_capacidad_anio.parquet`;
-- capas cartográficas limpias en `data/interim/cartografia/`;
+- panel SER barrio-intervalo final en `data/processed/core/ser/ser_barrio_intervalo_global_final.parquet`;
+- artefactos M0 en `data/processed/core/ser/modeling/ser_m0_selected_profiles.parquet` y `data/processed/core/ser/modeling/ser_m0_selected_model_metadata.json`;
+- cartografía limpia en `data/interim/cartografia/`;
 - oferta espacial SER limpia en `data/interim/ser/ser_calles_plazas/` y `data/interim/ser/ser_parquimetros/`;
 - autorizaciones e IVTM limpios como presión estructural en `data/interim/ser/`;
 - calendario laboral limpio en `data/interim/contexto/`;
-- inventario global EMT y mapa de identificadores en `data/processed/core/emt/`;
-- mapas SER en `reports/maps/` y figuras asociadas en `reports/figures/`.
-
-No se declara como existente ningún panel final de modelado SER ni modelo predictivo entrenado.
+- inventario global EMT en `data/processed/core/emt/inventario_global_emt.parquet`;
+- mapa de identificadores EMT en `data/processed/core/emt/parking_id_map.parquet`;
+- snapshot y join vivo EMT, cuando se escribe, en `data/interim/emt/emt_aparcamientos_rotacionales_tiempo_real/`;
+- mapas HTML en `reports/maps/`;
+- figuras asociadas en `reports/figures/ser_cartografia/`, `reports/figures/ser_emt_integrado/`, `reports/figures/ser_prediccion_proxy/` y `reports/figures/emt_tiempo_real/`.
 
 ## Reproducibilidad
 
@@ -100,24 +170,21 @@ El flujo distingue entre:
 
 - datos originales en `data/raw/`;
 - tablas limpias o normalizadas en `data/interim/`;
-- salidas analíticas en `data/processed/`.
+- salidas analíticas en `data/processed/`;
+- salidas cartográficas y visuales en `reports/`.
 
 Algunos datos pesados pueden no estar versionados. Este README no incluye instrucciones de instalación porque no hay un fichero de entorno validado en el repositorio.
 
 ## Limitaciones
 
-- Los tiques SER miden demanda pagada, no ocupación real total.
-- La ausencia de tiques no equivale a facilidad para aparcar.
-- Los pagos digitales no son localizables públicamente a parquímetro, calle o tramo.
-- EMT/off-street no debe mezclarse forzadamente con SER: representa otra capa de oferta y ocupación.
-- Las fuentes de contexto solo entran si superan criterios de calidad, cobertura y señal.
-- La granularidad fina por calle o parquímetro tiene incertidumbre espacial y no debe presentarse como verdad observada.
-
-## Pendiente de cierre
-
-- panel `SER_barrio_intervalo`;
-- comparación final de granularidades 15/30/45/60 minutos;
-- target proxy definitivo;
-- modelado predictivo SER, si procede;
-- previsión EMT, si procede;
-- mapa integrado SER + EMT final.
+- SER no observa ocupación total del estacionamiento regulado.
+- Los tiques SER miden demanda pagada, no demanda total ni disponibilidad completa.
+- La ausencia de tiques no implica facilidad efectiva para aparcar.
+- `ocupacion_pagada_proxy` depende de tiques observados, capacidad anual por barrio y régimen temporal.
+- `prob_aparcar_proxy` depende de supuestos metodológicos explícitos y debe leerse como escala relativa.
+- Los pagos app/digitales no son localizables públicamente a parquímetro, calle o tramo.
+- EMT tiempo real tiene cobertura parcial y puede cambiar entre ejecuciones porque procede de una API viva.
+- La ausencia de dato vivo EMT no indica por sí sola disponibilidad ni saturación.
+- `free_raw < 0` no se interpreta como plazas libres efectivas.
+- SER proxy y EMT tiempo real tienen naturalezas temporales distintas: SER es un escenario calculado por intervalo; EMT es una observación viva parcial.
+- La integración SER + EMT es cartográfica, no un único modelo estadístico.
