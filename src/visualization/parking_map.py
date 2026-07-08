@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from html import escape
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from textwrap import wrap
 from typing import Any
@@ -16,6 +19,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import pyproj
 from matplotlib.patches import Patch
+from shapely.geometry import box
 
 try:
     import folium
@@ -589,6 +593,299 @@ def _build_emt_tooltip(row: Any) -> str:
     return "<br>".join(parts) or "Aparcamiento EMT/off-street"
 
 
+def _reference_capacity_from_row(row: pd.Series | Any) -> tuple[Any, str | pd.NA]:
+    reference_capacity_fields = [
+        ("plazas_standard_emt", "EMT estándar"),
+        ("plazas_publicas_municipal", "municipal pública"),
+        ("plazas_automoviles_municipal", "municipal automóviles"),
+    ]
+    for field, source_label in reference_capacity_fields:
+        if isinstance(row, pd.Series):
+            if field not in row.index:
+                continue
+            value = row[field]
+        else:
+            if not hasattr(row, field):
+                continue
+            value = getattr(row, field)
+        if pd.isna(value):
+            continue
+        return value, source_label
+    return pd.NA, pd.NA
+
+
+def _emt_realtime_category(free_valid: Any, pct_free: Any) -> str:
+    if pd.isna(free_valid):
+        return "disponibilidad_informada_sin_capacidad"
+    if pd.isna(pct_free):
+        return "disponibilidad_informada_sin_capacidad"
+    pct = float(pct_free)
+    if pct < 0.30:
+        return "baja"
+    if pct < 0.70:
+        return "media"
+    return "alta"
+
+
+_EMT_NAME_STOPWORDS = {
+    "APARCAMIENTO",
+    "APARCAMIENTOS",
+    "PARKING",
+    "DE",
+    "DEL",
+    "LA",
+    "LAS",
+    "LOS",
+    "EL",
+    "EN",
+    "Y",
+}
+
+
+def _fold_text(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = unicodedata.normalize("NFKD", str(value))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^A-Z0-9]+", " ", text.upper()).strip()
+
+
+def _name_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in _fold_text(value).split()
+        if len(token) >= 3 and token not in _EMT_NAME_STOPWORDS
+    }
+
+
+def _emt_realtime_name_compatible(row: pd.Series) -> bool:
+    if "realtime_name" not in row.index or pd.isna(row.get("realtime_name")):
+        return True
+    if "nombre" not in row.index or pd.isna(row.get("nombre")):
+        return True
+    inventory_name = _fold_text(row["nombre"])
+    realtime_name = _fold_text(row["realtime_name"])
+    if not inventory_name or not realtime_name:
+        return True
+    inventory_tokens = _name_tokens(row["nombre"])
+    realtime_tokens = _name_tokens(row["realtime_name"])
+    if inventory_tokens and realtime_tokens and inventory_tokens.intersection(realtime_tokens):
+        return True
+    return SequenceMatcher(None, inventory_name, realtime_name).ratio() >= 0.62
+
+
+def _emt_realtime_name_mismatch_mask(df: pd.DataFrame) -> pd.Series:
+    if not {"nombre", "realtime_name"}.issubset(df.columns):
+        return pd.Series(False, index=df.index)
+    live = df["has_live_free"].fillna(False).astype(bool) if "has_live_free" in df else True
+    compatible = df.apply(_emt_realtime_name_compatible, axis=1)
+    return live & ~compatible
+
+
+def prepare_emt_realtime_layer(
+    emt_realtime_joined: pd.DataFrame,
+) -> gpd.GeoDataFrame:
+    required = {"has_live_free", "latitud", "longitud", "free_valid"}
+    missing = sorted(required - set(emt_realtime_joined.columns))
+    if missing:
+        raise ValueError(f"Faltan columnas en EMT realtime joined: {missing}")
+
+    live = emt_realtime_joined.loc[
+        emt_realtime_joined["has_live_free"].fillna(False).astype(bool)
+    ].copy()
+    live["latitud"] = pd.to_numeric(live["latitud"], errors="coerce")
+    live["longitud"] = pd.to_numeric(live["longitud"], errors="coerce")
+    live["free_raw"] = pd.to_numeric(live.get("free_raw"), errors="coerce")
+    live["free_valid"] = pd.to_numeric(live["free_valid"], errors="coerce")
+    live = live.loc[live["latitud"].notna() & live["longitud"].notna()].copy()
+    if {"nombre", "realtime_name"}.issubset(live.columns):
+        compatible_mask = live.apply(_emt_realtime_name_compatible, axis=1)
+        live = live.loc[compatible_mask].copy()
+
+    capacities = live.apply(_reference_capacity_from_row, axis=1, result_type="expand")
+    if capacities.empty:
+        live["plazas_referencia"] = pd.NA
+        live["fuente_capacidad"] = pd.NA
+    else:
+        live["plazas_referencia"] = pd.to_numeric(capacities[0], errors="coerce")
+        live["fuente_capacidad"] = capacities[1].astype("string")
+    live["pct_libre_referencia"] = (
+        live["free_valid"] / live["plazas_referencia"]
+    ).where(live["plazas_referencia"].gt(0))
+    live["pct_libre_referencia_label"] = (
+        (live["pct_libre_referencia"] * 100).round().astype("Int64").astype("string") + "%"
+    )
+    live.loc[live["pct_libre_referencia"].isna(), "pct_libre_referencia_label"] = pd.NA
+    live["categoria_disponibilidad_emt"] = [
+        _emt_realtime_category(free, pct)
+        for free, pct in zip(live["free_valid"], live["pct_libre_referencia"])
+    ]
+    live["categoria_disponibilidad_emt_label"] = live[
+        "categoria_disponibilidad_emt"
+    ].map(EMT_REALTIME_CATEGORY_LABELS)
+    live["marker_color"] = live["categoria_disponibilidad_emt"].map(
+        EMT_REALTIME_CATEGORY_COLORS
+    )
+    geometry = gpd.points_from_xy(live["longitud"], live["latitud"], crs=WEB_CRS)
+    gdf = gpd.GeoDataFrame(live, geometry=geometry, crs=WEB_CRS).to_crs(TARGET_CRS)
+    keep_columns = [
+        "parking_uid",
+        "id_emt",
+        "nombre",
+        "latitud",
+        "longitud",
+        "free_raw",
+        "free_valid",
+        "moment",
+        "query_timestamp",
+        "coverage_status",
+        "plazas_standard_emt",
+        "plazas_pmr_emt",
+        "plazas_publicas_municipal",
+        "plazas_automoviles_municipal",
+        "plazas_residentes_municipal",
+        "plazas_pmr_municipal",
+        "plazas_electricas_municipal",
+        "plazas_referencia",
+        "fuente_capacidad",
+        "pct_libre_referencia",
+        "pct_libre_referencia_label",
+        "categoria_disponibilidad_emt",
+        "categoria_disponibilidad_emt_label",
+        "marker_color",
+        "geometry",
+    ]
+    keep_columns = [column for column in keep_columns if column in gdf.columns]
+    return gdf.loc[:, keep_columns]
+
+
+def _format_time_value(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Europe/Madrid")
+    return ts.strftime("%H:%M:%S")
+
+
+def _format_datetime_value(value: Any) -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("Europe/Madrid")
+    return ts.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _format_integer_value(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        return str(int(round(float(numeric))))
+    return str(value)
+
+
+def _build_emt_realtime_tooltip(row: Any) -> str:
+    parts: list[str] = []
+    fields = [
+        ("nombre", "Nombre"),
+        ("free_valid", "Plazas libres informadas por API"),
+        ("plazas_standard_emt", "Plazas estándar EMT"),
+        ("plazas_pmr_emt", "Plazas PMR EMT"),
+        ("plazas_residentes_municipal", "Plazas residentes municipales"),
+        ("plazas_pmr_municipal", "Plazas PMR municipales"),
+        ("plazas_electricas_municipal", "Plazas eléctricas municipales"),
+    ]
+    for field, alias in fields:
+        if not hasattr(row, field):
+            continue
+        value = getattr(row, field)
+        if pd.isna(value):
+            continue
+        if field == "nombre":
+            formatted = str(value)
+        else:
+            formatted = _format_integer_value(value)
+        parts.append(f"<b>{escape(alias)}:</b> {escape(formatted)}")
+    return "<br>".join(parts) or "EMT tiempo real"
+
+
+def add_emt_mixed_marker_cluster(
+    fmap: folium.Map,
+    inventory_gdf: gpd.GeoDataFrame,
+    realtime_gdf: gpd.GeoDataFrame | None = None,
+    *,
+    name: str = "Aparcamientos EMT/off-street",
+    show: bool = True,
+) -> MarkerCluster:
+    cluster = MarkerCluster(name=name, show=show)
+    realtime_ids: set[int] = set()
+    if realtime_gdf is not None and not realtime_gdf.empty and "id_emt" in realtime_gdf.columns:
+        realtime_ids = set(realtime_gdf["id_emt"].dropna().astype(int))
+
+    inventory = inventory_gdf.copy()
+    if "id_emt" not in inventory.columns and "id_emt_referencia" in inventory.columns:
+        inventory["id_emt"] = inventory["id_emt_referencia"]
+    if realtime_ids and "id_emt" in inventory.columns:
+        inventory_ids = pd.to_numeric(inventory["id_emt"], errors="coerce")
+        inventory = inventory.loc[
+            inventory_ids.isna() | ~inventory_ids.astype("Int64").isin(realtime_ids)
+        ].copy()
+
+    emt_icon_html = """
+    <div style="
+        width: 18px; height: 18px; border-radius: 3px;
+        background: #7e22ce; color: white; border: 1px solid white;
+        box-shadow: 0 0 2px rgba(0,0,0,.45);
+        font-size: 10px; font-weight: 700; line-height: 18px;
+        text-align: center; font-family: Arial, sans-serif;">E</div>
+    """
+    for row in inventory.to_crs(WEB_CRS).itertuples(index=False):
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        folium.Marker(
+            location=[geom.y, geom.x],
+            icon=folium.DivIcon(
+                html=emt_icon_html,
+                icon_size=(18, 18),
+                icon_anchor=(9, 9),
+            ),
+            tooltip=folium.Tooltip(_build_emt_tooltip(row), sticky=False),
+        ).add_to(cluster)
+
+    if realtime_gdf is None or realtime_gdf.empty:
+        cluster.add_to(fmap)
+        return cluster
+
+    for row in realtime_gdf.to_crs(WEB_CRS).itertuples(index=False):
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        color = getattr(row, "marker_color", "#7c3aed")
+        free = getattr(row, "free_valid", "")
+        icon_html = f"""
+        <div style="
+            width: 24px; height: 24px; border-radius: 50%;
+            background: {escape(str(color))}; color: #111827; border: 2px solid white;
+            box-shadow: 0 0 3px rgba(0,0,0,.45);
+            font-size: 10px; font-weight: 800; line-height: 20px;
+            text-align: center; font-family: Arial, sans-serif;">{escape(str(int(free)) if pd.notna(free) else "E")}</div>
+        """
+        folium.Marker(
+            location=[geom.y, geom.x],
+            icon=folium.DivIcon(
+                html=icon_html,
+                icon_size=(24, 24),
+                icon_anchor=(12, 12),
+            ),
+            tooltip=folium.Tooltip(_build_emt_realtime_tooltip(row), sticky=False),
+        ).add_to(cluster)
+    cluster.add_to(fmap)
+    return cluster
+
+
 def build_ser_emt_base_map(
     layers: dict[str, gpd.GeoDataFrame],
     *,
@@ -936,6 +1233,18 @@ PREDICTION_CATEGORY_COLORS = {
     "baja": "#fecaca",
     "media": "#fef3c7",
     "alta": "#bbf7d0",
+}
+EMT_REALTIME_CATEGORY_COLORS = {
+    "baja": "#fca5a5",
+    "media": "#fef3c7",
+    "alta": "#bbf7d0",
+    "disponibilidad_informada_sin_capacidad": "#7c3aed",
+}
+EMT_REALTIME_CATEGORY_LABELS = {
+    "baja": "Baja: 0–29% libres sobre capacidad ref.",
+    "media": "Media: 30–69% libres sobre capacidad ref.",
+    "alta": "Alta: 70–100% libres sobre capacidad ref.",
+    "disponibilidad_informada_sin_capacidad": "Libres informadas sin capacidad ref.",
 }
 WEEKDAY_LABELS = {
     0: "lunes",
@@ -1371,7 +1680,7 @@ def _add_prediction_map_controls(fmap: folium.Map, scenario: dict[str, Any]) -> 
         }
     </style>
     """
-    legend_html = """
+    legend_html = f"""
     <div style="
         position: fixed;
         bottom: 28px;
@@ -1397,11 +1706,98 @@ def _add_prediction_map_controls(fmap: folium.Map, scenario: dict[str, Any]) -> 
     fmap.get_root().html.add_child(folium.Element(legend_html))
 
 
+def _add_prediction_emt_realtime_map_controls(
+    fmap: folium.Map,
+    scenario: dict[str, Any],
+) -> None:
+    hora_solicitada = scenario.get("hora_solicitada")
+    hora_line = (
+        f"<div><b>Hora solicitada:</b> {escape(str(hora_solicitada))}</div>"
+        if hora_solicitada
+        else ""
+    )
+    emt_query = scenario.get("emt_query_timestamp_label") or "sin dato"
+    emt_moment = scenario.get("emt_moment_label") or "sin dato vivo"
+    residual_legend_line = (
+        '<div><span style="display:inline-block;width:14px;height:10px;background:#7c3aed;border:1px solid #9ca3af;margin-right:6px;"></span>Libres informadas sin capacidad ref.</div>'
+        if scenario.get("emt_has_residual_capacity_category")
+        else ""
+    )
+    scenario_html = f"""
+    <div style="
+        position: fixed;
+        top: 74px;
+        left: 10px;
+        right: auto;
+        z-index: 9999;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        color: #111827;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+        max-width: 330px;
+        pointer-events: none;
+    ">
+        <div style="font-weight:700; margin-bottom:6px;">SER proxy + EMT tiempo real</div>
+        <div style="font-weight:700; margin-top:4px;">SER proxy</div>
+        <div><b>Fecha:</b> {escape(str(scenario.get("fecha_label", "")))}</div>
+        {hora_line}
+        <div><b>Intervalo SER usado:</b> {escape(str(scenario.get("intervalo_label", "")))}</div>
+        <div style="font-weight:700; margin-top:6px;">EMT tiempo real</div>
+        <div><b>Consulta API:</b> {escape(str(emt_query))}</div>
+        <div><b>Dato EMT:</b> {escape(str(emt_moment))}</div>
+        <div style="margin-top:6px;"><b>Nota:</b> SER es una escala proxy estimada; EMT es disponibilidad viva parcial observada en la API.</div>
+    </div>
+    """
+    search_css = """
+    <style>
+        .leaflet-control-search {
+            margin-top: 230px !important;
+        }
+    </style>
+    """
+    legend_html = f"""
+    <div style="
+        position: fixed;
+        bottom: 28px;
+        right: 14px;
+        z-index: 9999;
+        background: rgba(255,255,255,0.94);
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        color: #111827;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    ">
+        <div style="font-weight:700; margin-bottom:6px;">Facilidad proxy SER</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fecaca;border:1px solid #9ca3af;margin-right:6px;"></span>Baja: 0–29%</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fef3c7;border:1px solid #9ca3af;margin-right:6px;"></span>Media: 30–69%</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#bbf7d0;border:1px solid #9ca3af;margin-right:6px;"></span>Alta: 70–100%</div>
+        <div style="font-weight:700; margin:8px 0 4px;">EMT tiempo real</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fca5a5;border:1px solid #9ca3af;margin-right:6px;"></span>Baja: 0–29% libres sobre capacidad ref.</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#fef3c7;border:1px solid #9ca3af;margin-right:6px;"></span>Media: 30–69% libres sobre capacidad ref.</div>
+        <div><span style="display:inline-block;width:14px;height:10px;background:#bbf7d0;border:1px solid #9ca3af;margin-right:6px;"></span>Alta: 70–100% libres sobre capacidad ref.</div>
+        {residual_legend_line}
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(search_css))
+    fmap.get_root().html.add_child(folium.Element(scenario_html))
+    fmap.get_root().html.add_child(folium.Element(legend_html))
+
+
 def build_ser_prediction_base_map(
     layers: dict[str, gpd.GeoDataFrame],
     scenario: dict[str, Any],
     *,
     web_simplify_m: float = 0.5,
+    emt_realtime_layer: gpd.GeoDataFrame | None = None,
+    show_emt_inventory: bool = True,
+    controls_builder: Any | None = None,
 ) -> folium.Map:
     limite_web = to_web(layers["limite_map"], web_simplify_m)
     prediction_web = to_web(layers["prediction_barrios"], web_simplify_m).reset_index(drop=True)
@@ -1539,26 +1935,37 @@ def build_ser_prediction_base_map(
         tooltip_default="Parquímetro SER",
     )
 
-    emt_icon_html = """
-    <div style="
-        width: 18px; height: 18px; border-radius: 3px;
-        background: #7e22ce; color: white; border: 1px solid white;
-        box-shadow: 0 0 2px rgba(0,0,0,.45);
-        font-size: 10px; font-weight: 700; line-height: 18px;
-        text-align: center; font-family: Arial, sans-serif;">E</div>
-    """
-    add_marker_cluster(
-        fmap,
-        layers["emt_map"],
-        name="Aparcamientos EMT/off-street",
-        icon_html=emt_icon_html,
-        icon_size=(18, 18),
-        icon_anchor=(9, 9),
-        show=True,
-        tooltip_builder=_build_emt_tooltip,
-    )
+    if emt_realtime_layer is not None and not emt_realtime_layer.empty:
+        add_emt_mixed_marker_cluster(
+            fmap,
+            layers["emt_map"],
+            emt_realtime_layer,
+            name="Aparcamientos EMT/off-street",
+            show=True,
+        )
+    else:
+        emt_icon_html = """
+        <div style="
+            width: 18px; height: 18px; border-radius: 3px;
+            background: #7e22ce; color: white; border: 1px solid white;
+            box-shadow: 0 0 2px rgba(0,0,0,.45);
+            font-size: 10px; font-weight: 700; line-height: 18px;
+            text-align: center; font-family: Arial, sans-serif;">E</div>
+        """
+        add_marker_cluster(
+            fmap,
+            layers["emt_map"],
+            name="Aparcamientos EMT/off-street",
+            icon_html=emt_icon_html,
+            icon_size=(18, 18),
+            icon_anchor=(9, 9),
+            show=show_emt_inventory,
+            tooltip_builder=_build_emt_tooltip,
+        )
     _add_prediction_labels(fmap, layers["prediction_barrios"])
-    _add_prediction_map_controls(fmap, scenario)
+    if controls_builder is None:
+        controls_builder = _add_prediction_map_controls
+    controls_builder(fmap, scenario)
     bounds = limite_web.total_bounds
     fmap.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
     folium.LayerControl(collapsed=False).add_to(fmap)
@@ -1648,6 +2055,158 @@ def save_ser_prediction_static_figure(
     ax.legend(
         handles=legend_handles,
         title="Facilidad proxy SER",
+        loc="lower left",
+        frameon=True,
+        framealpha=0.92,
+        fontsize=8,
+        title_fontsize=9,
+    )
+    return _save_figure(fig, output_path)
+
+
+def _short_parking_name(value: Any, width: int = 14) -> str:
+    if value is None or pd.isna(value):
+        return "EMT"
+    text = str(value).replace("Aparcamiento", "").replace("aparcamiento", "").strip()
+    lines = wrap(text.title(), width=width, max_lines=2)
+    return "\n".join(lines) if lines else "EMT"
+
+
+def _dense_points_window(
+    gdf: gpd.GeoDataFrame,
+    *,
+    radius_m: float = 1800,
+    min_half_window_m: float = 2200,
+) -> tuple[float, float, float, float]:
+    if gdf.empty:
+        raise ValueError("No hay puntos EMT tiempo real para calcular el zoom.")
+    if len(gdf) == 1:
+        point = gdf.geometry.iloc[0]
+        return (
+            point.x - min_half_window_m,
+            point.y - min_half_window_m,
+            point.x + min_half_window_m,
+            point.y + min_half_window_m,
+        )
+    counts = []
+    for geom in gdf.geometry:
+        counts.append(int(gdf.geometry.distance(geom).le(radius_m).sum()))
+    center = gdf.geometry.iloc[int(pd.Series(counts).idxmax())]
+    window = max(radius_m * 1.25, min_half_window_m)
+    return (
+        center.x - window,
+        center.y - window,
+        center.x + window,
+        center.y + window,
+    )
+
+
+def save_emt_realtime_zoom_figure(
+    layers: dict[str, gpd.GeoDataFrame],
+    output_path: Path,
+    scenario: dict[str, Any],
+    *,
+    radius_m: float = 1800,
+) -> Path:
+    emt_live = layers.get("emt_realtime_map")
+    if emt_live is None or emt_live.empty:
+        raise ValueError("No hay aparcamientos EMT con ocupación viva para guardar PNG.")
+    minx, miny, maxx, maxy = _dense_points_window(emt_live, radius_m=radius_m)
+    window_geom = box(minx, miny, maxx, maxy)
+    emt_zoom = emt_live.loc[emt_live.geometry.intersects(window_geom).fillna(False)].copy()
+    if emt_zoom.empty:
+        emt_zoom = emt_live.copy()
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    if "callejero_map" in layers:
+        callejero_zoom = layers["callejero_map"].loc[
+            layers["callejero_map"].geometry.intersects(window_geom).fillna(False)
+        ]
+        if not callejero_zoom.empty:
+            callejero_zoom.plot(
+                ax=ax,
+                color="#f8fafc",
+                edgecolor="#d1d5db",
+                linewidth=0.18,
+                alpha=0.9,
+                zorder=1,
+            )
+    if "limite_map" in layers:
+        layers["limite_map"].boundary.plot(
+            ax=ax,
+            color="#111827",
+            linewidth=1.0,
+            alpha=0.75,
+            zorder=2,
+        )
+    if "bandas_map" in layers:
+        bandas_zoom = layers["bandas_map"].loc[
+            layers["bandas_map"].geometry.intersects(window_geom).fillna(False)
+        ].copy()
+        if not bandas_zoom.empty:
+            for color_key, color_value in COLOR_STYLE.items():
+                subset = bandas_zoom.loc[bandas_zoom["color"].eq(color_key)]
+                if subset.empty:
+                    continue
+                subset.plot(
+                    ax=ax,
+                    color=color_value,
+                    linewidth=1.1,
+                    alpha=0.55,
+                    zorder=3,
+                )
+
+    for category, label in EMT_REALTIME_CATEGORY_LABELS.items():
+        subset = emt_zoom.loc[emt_zoom["categoria_disponibilidad_emt"].eq(category)]
+        if subset.empty:
+            continue
+        subset.plot(
+            ax=ax,
+            color=EMT_REALTIME_CATEGORY_COLORS[category],
+            edgecolor="white",
+            linewidth=1.2,
+            markersize=95,
+            label=label,
+            zorder=4,
+        )
+
+    for row in emt_zoom.itertuples(index=False):
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        name = _short_parking_name(getattr(row, "nombre", None))
+        free = getattr(row, "free_valid", pd.NA)
+        label = f"{name}\n{int(free) if pd.notna(free) else 's/d'} libres"
+        text = ax.text(
+            geom.x,
+            geom.y,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=6.4,
+            fontweight="bold",
+            color="#111827",
+            clip_on=True,
+            zorder=5,
+        )
+        text.set_path_effects(
+            [path_effects.Stroke(linewidth=2.1, foreground="white"), path_effects.Normal()]
+        )
+
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
+    ax.set_axis_off()
+    query_label = scenario.get("emt_query_timestamp_label") or "consulta sin hora"
+    ax.set_title(
+        (
+            f"EMT tiempo real — disponibilidad viva ({query_label})\n"
+            "Snapshot vivo parcial; no histórico ni predicción."
+        ),
+        fontsize=13,
+        pad=14,
+    )
+    ax.legend(
+        title="Disponibilidad EMT",
         loc="lower left",
         frameon=True,
         framealpha=0.92,
@@ -1765,6 +2324,273 @@ def build_ser_prediction_map_from_operational(
         outputs["exists"] = outputs["path"].map(lambda p: (root / p).exists())
         outputs["size_mb"] = outputs["path"].map(
             lambda p: round((root / p).stat().st_size / 1024**2, 3) if (root / p).exists() else pd.NA
+        )
+
+    return SERPredictionMapResult(
+        folium_map=fmap,
+        layers=layers,
+        checks=checks_df,
+        diagnostics=diagnostics,
+        outputs=outputs,
+        scenario=scenario,
+    )
+
+
+def _emt_realtime_scenario_fields(
+    emt_realtime_layer: gpd.GeoDataFrame,
+    emt_realtime_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    metadata = emt_realtime_metadata or {}
+    query_value = metadata.get("query_timestamp_utc")
+    if query_value is None and "query_timestamp" in emt_realtime_layer.columns:
+        query_values = emt_realtime_layer["query_timestamp"].dropna()
+        query_value = query_values.iloc[0] if not query_values.empty else None
+
+    moment_label = None
+    if "moment" in emt_realtime_layer.columns:
+        moments = pd.to_datetime(emt_realtime_layer["moment"], errors="coerce").dropna()
+        if not moments.empty:
+            moment_min = moments.min()
+            moment_max = moments.max()
+            if moment_min == moment_max:
+                moment_label = _format_datetime_value(moment_max)
+            else:
+                moment_label = (
+                    f"{_format_datetime_value(moment_min)} – "
+                    f"{_format_datetime_value(moment_max)}"
+                )
+    return {
+        "emt_query_timestamp": query_value,
+        "emt_query_timestamp_label": _format_datetime_value(query_value),
+        "emt_moment_label": moment_label,
+    }
+
+
+def build_ser_prediction_map_with_emt_realtime(
+    *,
+    root: Path,
+    operational: pd.DataFrame,
+    scenario_metadata: dict[str, Any],
+    emt_realtime_joined: pd.DataFrame,
+    emt_realtime_metadata: dict[str, Any],
+    html_output_path: Path | None = None,
+    png_emt_realtime_zoom_output_path: Path | None = None,
+    target_year: int | None = None,
+    visual_buffer_m: float = 25,
+    web_simplify_m: float = 0.5,
+    expected_model_barrios: int = 65,
+    expected_emt_entities: int = 85,
+) -> SERPredictionMapResult:
+    root = root.resolve()
+    if target_year is None:
+        target_year = int(scenario_metadata.get("target_year", 2026))
+
+    layers, checks, diagnostics = _base_ser_emt_layers_and_diagnostics(
+        root=root,
+        target_year=target_year,
+        expected_model_barrios=expected_model_barrios,
+        expected_emt_entities=expected_emt_entities,
+        visual_buffer_m=visual_buffer_m,
+    )
+    prediction_barrios, prediction_checks, prediction_diagnostics = _prepare_prediction_barrios(
+        layers["barrios_model_map"],
+        operational,
+        expected_model_barrios=expected_model_barrios,
+    )
+    checks.extend(prediction_checks)
+    diagnostics.update(prediction_diagnostics)
+
+    emt_realtime_name_mismatches = emt_realtime_joined.loc[
+        _emt_realtime_name_mismatch_mask(emt_realtime_joined)
+    ].copy()
+    emt_realtime_layer = prepare_emt_realtime_layer(emt_realtime_joined)
+    limite_geom = _union_geometry(layers["limite_map"])
+    visual_area = limite_geom.buffer(visual_buffer_m)
+    realtime_in_visual_mask = emt_realtime_layer.geometry.intersects(visual_area).fillna(False)
+    emt_realtime_map = emt_realtime_layer.loc[realtime_in_visual_mask].copy()
+    emt_realtime_outside = emt_realtime_layer.loc[~realtime_in_visual_mask].copy()
+    layers["prediction_barrios"] = prediction_barrios
+    layers["emt_realtime_live_all"] = emt_realtime_layer
+    layers["emt_realtime_map"] = emt_realtime_map
+    realtime_ids = (
+        set(emt_realtime_map["id_emt"].dropna().astype(int))
+        if "id_emt" in emt_realtime_map.columns
+        else set()
+    )
+    emt_inventory_for_final = layers["emt_map"].copy()
+    if "id_emt" not in emt_inventory_for_final.columns and "id_emt_referencia" in emt_inventory_for_final.columns:
+        emt_inventory_for_final["id_emt"] = emt_inventory_for_final["id_emt_referencia"]
+    if realtime_ids and "id_emt" in emt_inventory_for_final.columns:
+        inventory_ids = pd.to_numeric(emt_inventory_for_final["id_emt"], errors="coerce")
+        n_inventory_static_shown = int(
+            (inventory_ids.isna() | ~inventory_ids.astype("Int64").isin(realtime_ids)).sum()
+        )
+    else:
+        n_inventory_static_shown = len(emt_inventory_for_final)
+    diagnostics["emt_realtime_layer"] = pd.DataFrame(
+        [
+            {
+                "n_joined_rows": len(emt_realtime_joined),
+                "n_live_joined_before_name_filter": int(
+                    emt_realtime_joined["has_live_free"].fillna(False).astype(bool).sum()
+                )
+                if "has_live_free" in emt_realtime_joined
+                else pd.NA,
+                "n_live_excluded_name_mismatch": len(emt_realtime_name_mismatches),
+                "n_live_rows": len(emt_realtime_layer),
+                "n_live_rows_visible": len(emt_realtime_map),
+                "n_inventory_static_shown_without_live": n_inventory_static_shown,
+                "n_live_with_capacity_reference": int(
+                    emt_realtime_map["plazas_referencia"].notna().sum()
+                )
+                if "plazas_referencia" in emt_realtime_map
+                else 0,
+                "n_live_with_pct_reference": int(
+                    emt_realtime_map["pct_libre_referencia"].notna().sum()
+                )
+                if "pct_libre_referencia" in emt_realtime_map
+                else 0,
+            }
+        ]
+    )
+    diagnostics["emt_realtime_spatial_filter"] = pd.DataFrame(
+        [
+            {
+                "n_emt_realtime_live_total": len(emt_realtime_layer),
+                "n_emt_realtime_live_in_visual_area": len(emt_realtime_map),
+                "n_emt_realtime_live_outside_visual_area": len(emt_realtime_outside),
+                "visual_buffer_m": visual_buffer_m,
+            }
+        ]
+    )
+    excluded_columns = ["id_emt", "nombre", "free_valid", "latitud", "longitud"]
+    diagnostics["emt_realtime_outside_visual_area"] = emt_realtime_outside.loc[
+        :, [column for column in excluded_columns if column in emt_realtime_outside.columns]
+    ].copy()
+    mismatch_columns = [
+        "parking_uid",
+        "id_emt",
+        "nombre",
+        "realtime_name",
+        "realtime_address",
+        "free_valid",
+        "moment",
+    ]
+    diagnostics["emt_realtime_name_mismatch_excluded"] = emt_realtime_name_mismatches.loc[
+        :,
+        [column for column in mismatch_columns if column in emt_realtime_name_mismatches.columns],
+    ].copy()
+    if "categoria_disponibilidad_emt" in emt_realtime_map:
+        diagnostics["emt_realtime_categories"] = (
+            emt_realtime_map.groupby(
+                ["categoria_disponibilidad_emt", "categoria_disponibilidad_emt_label"],
+                dropna=False,
+            )
+            .size()
+            .reset_index(name="n_aparcamientos")
+        )
+    else:
+        diagnostics["emt_realtime_categories"] = pd.DataFrame(
+            columns=[
+                "categoria_disponibilidad_emt",
+                "categoria_disponibilidad_emt_label",
+                "n_aparcamientos",
+            ]
+        )
+    _append_check(
+        checks,
+        "emt_realtime_live_layer_not_empty",
+        "OK" if not emt_realtime_map.empty else "WARNING",
+        f"live_rows_visible={len(emt_realtime_map)}; live_rows_total={len(emt_realtime_layer)}",
+        False,
+    )
+    _append_check(
+        checks,
+        "emt_realtime_outside_visual_area",
+        "WARNING" if len(emt_realtime_outside) else "OK",
+        f"outside={len(emt_realtime_outside)}; in_visual_area={len(emt_realtime_map)}",
+        False,
+    )
+
+    scenario = _scenario_from_operational(operational, scenario_metadata)
+    scenario.update(_emt_realtime_scenario_fields(emt_realtime_map, emt_realtime_metadata))
+    scenario["emt_has_residual_capacity_category"] = bool(
+        "categoria_disponibilidad_emt" in emt_realtime_map.columns
+        and emt_realtime_map["categoria_disponibilidad_emt"]
+        .eq("disponibilidad_informada_sin_capacidad")
+        .any()
+    )
+    diagnostics["scenario"] = pd.DataFrame([scenario])
+
+    checks_df = pd.DataFrame(checks, columns=["check_id", "status", "detail", "critical"])
+    failing_critical = checks_df.loc[
+        checks_df["critical"].eq(True) & checks_df["status"].eq("FAIL")
+    ]
+    if not failing_critical.empty:
+        detail = "; ".join(
+            f"{row.check_id}: {row.detail}" for row in failing_critical.itertuples(index=False)
+        )
+        raise ValueError(f"Critical checks failed: {detail}")
+
+    fmap = build_ser_prediction_base_map(
+        layers,
+        scenario,
+        web_simplify_m=web_simplify_m,
+        emt_realtime_layer=emt_realtime_map,
+        show_emt_inventory=False,
+        controls_builder=_add_prediction_emt_realtime_map_controls,
+    )
+
+    outputs_rows: list[dict[str, Any]] = []
+    if html_output_path is not None:
+        html_output_path = root / html_output_path if not html_output_path.is_absolute() else html_output_path
+        html_output_path.parent.mkdir(parents=True, exist_ok=True)
+        fmap.save(html_output_path)
+        outputs_rows.append(
+            {"output": "html_ser_emt_tiempo_real_proxy", "path": relpath(html_output_path, root)}
+        )
+        _append_check(
+            checks,
+            "html_ser_emt_realtime_proxy_generated",
+            "OK" if html_output_path.exists() else "FAIL",
+            relpath(html_output_path, root),
+            True,
+        )
+    if png_emt_realtime_zoom_output_path is not None:
+        png_path = (
+            root / png_emt_realtime_zoom_output_path
+            if not png_emt_realtime_zoom_output_path.is_absolute()
+            else png_emt_realtime_zoom_output_path
+        )
+        save_emt_realtime_zoom_figure(layers, png_path, scenario)
+        outputs_rows.append(
+            {"output": "png_emt_tiempo_real_zoom", "path": relpath(png_path, root)}
+        )
+        _append_check(
+            checks,
+            "png_emt_realtime_zoom_generated",
+            "OK" if png_path.exists() else "FAIL",
+            relpath(png_path, root),
+            True,
+        )
+
+    checks_df = pd.DataFrame(checks, columns=["check_id", "status", "detail", "critical"])
+    failing_critical = checks_df.loc[
+        checks_df["critical"].eq(True) & checks_df["status"].eq("FAIL")
+    ]
+    if not failing_critical.empty:
+        detail = "; ".join(
+            f"{row.check_id}: {row.detail}" for row in failing_critical.itertuples(index=False)
+        )
+        raise ValueError(f"Critical checks failed: {detail}")
+
+    outputs = pd.DataFrame(outputs_rows, columns=["output", "path"])
+    if not outputs.empty:
+        outputs["exists"] = outputs["path"].map(lambda p: (root / p).exists())
+        outputs["size_mb"] = outputs["path"].map(
+            lambda p: round((root / p).stat().st_size / 1024**2, 3)
+            if (root / p).exists()
+            else pd.NA
         )
 
     return SERPredictionMapResult(
