@@ -142,6 +142,10 @@ Los notebooks cartográficos `03_01` a `03_05` consumen salidas previas y constr
 - `reports/`: mapas, figuras y tablas generadas, con salidas pesadas no versionadas salvo las necesarias.
 - `data_catalog.csv`: catálogo de fuentes, rutas, estados y notebooks relacionados.
 
+## Fuentes y reutilización
+
+Origen de los datos: Ayuntamiento de Madrid y, cuando corresponde, Empresa Municipal de Transportes de Madrid (EMT). Las fuentes, periodos de referencia y URLs oficiales utilizadas se documentan en `data_catalog.csv`. Los documentos conservados en `docs/source_docs/` sirven como respaldo documental de las fuentes empleadas.
+
 ## Reproducibilidad
 
 El entorno se declara en `environment.yml`.
@@ -149,6 +153,12 @@ El entorno se declara en `environment.yml`.
 ```bash
 conda env create -f environment.yml
 conda activate tfm-parking
+```
+
+Los notebooks utilizan el kernel `tfm-parking`, que puede registrarse con:
+
+```bash
+python -m ipykernel install --user --name tfm-parking --display-name "Python (tfm-parking)"
 ```
 
 El repositorio público no incluye todos los datos pesados. Para reproducir el flujo completo es necesario descargar o disponer localmente de las fuentes originales indicadas en `data_catalog.csv` y respetar la estructura `data/raw`, `data/interim` y `data/processed`.
