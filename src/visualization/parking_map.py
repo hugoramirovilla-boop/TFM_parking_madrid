@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import unicodedata
 from html import escape
 from dataclasses import dataclass
@@ -10,8 +11,9 @@ from pathlib import Path
 from textwrap import wrap
 from typing import Any
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/private/tmp")
+_TMP_DIR = tempfile.gettempdir()
+os.environ.setdefault("MPLCONFIGDIR", str(Path(_TMP_DIR) / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", _TMP_DIR)
 
 import geopandas as gpd
 import matplotlib.patheffects as path_effects
@@ -689,7 +691,9 @@ def prepare_emt_realtime_layer(
     required = {"has_live_free", "latitud", "longitud", "free_valid"}
     missing = sorted(required - set(emt_realtime_joined.columns))
     if missing:
-        raise ValueError(f"Faltan columnas en EMT realtime joined: {missing}")
+        raise ValueError(
+            f"Faltan columnas en la unión de disponibilidad viva off-street: {missing}"
+        )
 
     live = emt_realtime_joined.loc[
         emt_realtime_joined["has_live_free"].fillna(False).astype(bool)
@@ -791,7 +795,7 @@ def _build_emt_realtime_tooltip(row: Any) -> str:
     parts: list[str] = []
     fields = [
         ("nombre", "Nombre"),
-        ("free_valid", "Plazas libres informadas por API"),
+        ("free_valid", "Plazas libres informadas por el servicio municipal"),
         ("plazas_standard_emt", "Plazas estándar EMT"),
         ("plazas_pmr_emt", "Plazas PMR EMT"),
         ("plazas_residentes_municipal", "Plazas residentes municipales"),
@@ -809,7 +813,7 @@ def _build_emt_realtime_tooltip(row: Any) -> str:
         else:
             formatted = _format_integer_value(value)
         parts.append(f"<b>{escape(alias)}:</b> {escape(formatted)}")
-    return "<br>".join(parts) or "EMT tiempo real"
+    return "<br>".join(parts) or "Tiempo real municipal"
 
 
 def add_emt_mixed_marker_cluster(
@@ -1742,15 +1746,15 @@ def _add_prediction_emt_realtime_map_controls(
         max-width: 330px;
         pointer-events: none;
     ">
-        <div style="font-weight:700; margin-bottom:6px;">SER proxy + EMT tiempo real</div>
+        <div style="font-weight:700; margin-bottom:6px;">SER proxy + disponibilidad off-street</div>
         <div style="font-weight:700; margin-top:4px;">SER proxy</div>
         <div><b>Fecha:</b> {escape(str(scenario.get("fecha_label", "")))}</div>
         {hora_line}
         <div><b>Intervalo SER usado:</b> {escape(str(scenario.get("intervalo_label", "")))}</div>
-        <div style="font-weight:700; margin-top:6px;">EMT tiempo real</div>
-        <div><b>Consulta API:</b> {escape(str(emt_query))}</div>
-        <div><b>Dato EMT:</b> {escape(str(emt_moment))}</div>
-        <div style="margin-top:6px;"><b>Nota:</b> SER es una escala proxy estimada; EMT es disponibilidad viva parcial observada en la API.</div>
+        <div style="font-weight:700; margin-top:6px;">Tiempo real municipal</div>
+        <div><b>Consulta de tiempo real:</b> {escape(str(emt_query))}</div>
+        <div><b>Dato vivo:</b> {escape(str(emt_moment))}</div>
+        <div style="margin-top:6px;"><b>Nota:</b> SER es una escala proxy estimada; la disponibilidad off-street es una observación viva parcial.</div>
     </div>
     """
     search_css = """
@@ -1779,7 +1783,7 @@ def _add_prediction_emt_realtime_map_controls(
         <div><span style="display:inline-block;width:14px;height:10px;background:#fecaca;border:1px solid #9ca3af;margin-right:6px;"></span>Baja: 0–29%</div>
         <div><span style="display:inline-block;width:14px;height:10px;background:#fef3c7;border:1px solid #9ca3af;margin-right:6px;"></span>Media: 30–69%</div>
         <div><span style="display:inline-block;width:14px;height:10px;background:#bbf7d0;border:1px solid #9ca3af;margin-right:6px;"></span>Alta: 70–100%</div>
-        <div style="font-weight:700; margin:8px 0 4px;">EMT tiempo real</div>
+        <div style="font-weight:700; margin:8px 0 4px;">Disponibilidad off-street</div>
         <div><span style="display:inline-block;width:14px;height:10px;background:#fca5a5;border:1px solid #9ca3af;margin-right:6px;"></span>Baja: 0–29% libres sobre capacidad ref.</div>
         <div><span style="display:inline-block;width:14px;height:10px;background:#fef3c7;border:1px solid #9ca3af;margin-right:6px;"></span>Media: 30–69% libres sobre capacidad ref.</div>
         <div><span style="display:inline-block;width:14px;height:10px;background:#bbf7d0;border:1px solid #9ca3af;margin-right:6px;"></span>Alta: 70–100% libres sobre capacidad ref.</div>
@@ -2080,7 +2084,7 @@ def _dense_points_window(
     min_half_window_m: float = 2200,
 ) -> tuple[float, float, float, float]:
     if gdf.empty:
-        raise ValueError("No hay puntos EMT tiempo real para calcular el zoom.")
+        raise ValueError("No hay puntos de disponibilidad viva off-street para calcular el zoom.")
     if len(gdf) == 1:
         point = gdf.geometry.iloc[0]
         return (
@@ -2221,7 +2225,7 @@ def save_emt_realtime_zoom_figure(
 ) -> Path:
     emt_live = layers.get("emt_realtime_map")
     if emt_live is None or emt_live.empty:
-        raise ValueError("No hay aparcamientos EMT con ocupación viva para guardar PNG.")
+        raise ValueError("No hay aparcamientos off-street con disponibilidad viva para guardar PNG.")
     minx, miny, maxx, maxy = _dense_points_window(emt_live, radius_m=radius_m)
     window_geom = box(minx, miny, maxx, maxy)
     emt_zoom = emt_live.loc[emt_live.geometry.intersects(window_geom).fillna(False)].copy()
@@ -2321,7 +2325,7 @@ def save_emt_realtime_zoom_figure(
     query_label = scenario.get("emt_query_timestamp_label") or "consulta sin hora"
     ax.set_title(
         (
-            f"EMT tiempo real — disponibilidad viva ({query_label})\n"
+            f"Tiempo real municipal — disponibilidad viva off-street ({query_label})\n"
             "Snapshot vivo parcial; no histórico ni predicción."
         ),
         fontsize=13,
@@ -2343,7 +2347,7 @@ def save_emt_realtime_zoom_figure(
     ]
     ax.legend(
         handles=legend_handles,
-        title="Disponibilidad EMT",
+        title="Disponibilidad off-street",
         loc="lower left",
         frameon=True,
         framealpha=0.92,

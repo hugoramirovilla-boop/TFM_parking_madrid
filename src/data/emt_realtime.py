@@ -11,7 +11,7 @@ import requests
 
 DEFAULT_ENDPOINT_URL = "https://servayto.madrid.es/MTPAR_WSINFO/InfoParking"
 SOAP_ACTION = "http://tempuri.org/iInfoParking/GetListParking"
-SOURCE_ID = "emt_realtime_api"
+SOURCE_ID = "municipal_realtime_service"
 
 
 @dataclass
@@ -57,7 +57,9 @@ def fetch_emt_realtime_xml(
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        raise RuntimeError(f"Error consultando la API EMT realtime: {exc}") from exc
+        raise RuntimeError(
+            f"Error consultando el servicio municipal de ocupación en tiempo real: {exc}"
+        ) from exc
 
     metadata = {
         "endpoint_url": endpoint_url,
@@ -70,10 +72,13 @@ def fetch_emt_realtime_xml(
     if response.status_code != 200:
         detail = response.text[:500] if response.text else ""
         raise RuntimeError(
-            f"API EMT realtime devolvió HTTP {response.status_code}. {detail}"
+            "El servicio municipal de ocupación en tiempo real devolvió "
+            f"HTTP {response.status_code}. {detail}"
         )
     if not response.content:
-        raise RuntimeError("API EMT realtime devolvió una respuesta vacía.")
+        raise RuntimeError(
+            "El servicio municipal de ocupación en tiempo real devolvió una respuesta vacía."
+        )
     return response.content, metadata
 
 
@@ -338,7 +343,7 @@ def build_emt_realtime_from_api(
     failures = checks.loc[checks["status"].eq("FAIL") & checks["critical"]]
     if not failures.empty:
         raise ValueError(
-            "Fallos críticos en EMT realtime: "
+            "Fallos críticos en la disponibilidad viva off-street: "
             + "; ".join(failures["check_id"].astype(str).tolist())
         )
 
@@ -364,7 +369,7 @@ def _parse_xml(xml_content: bytes | str) -> ET.Element:
     try:
         return ET.fromstring(xml_content)
     except ET.ParseError as exc:
-        raise ValueError(f"XML EMT realtime no parseable: {exc}") from exc
+        raise ValueError(f"XML de tiempo real municipal no parseable: {exc}") from exc
 
 
 def _parse_nested_xml_payload(root: ET.Element) -> ET.Element | None:
