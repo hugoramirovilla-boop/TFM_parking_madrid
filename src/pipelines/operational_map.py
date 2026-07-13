@@ -74,7 +74,7 @@ def build_operational_ser_emt_realtime_map(
     html_output_path: Path | str | None = None,
     png_emt_realtime_zoom_output_path: Path | str | None = None,
 ) -> OperationalSEREMTMapResult:
-    """Ejecuta el flujo operativo final SER proxy + EMT tiempo real + mapa."""
+    """Ejecuta el flujo operativo final SER proxy + disponibilidad viva off-street + mapa."""
     root_path = _find_repo_root() if root is None else Path(root).resolve()
     if write_realtime_snapshots is None:
         write_realtime_snapshots = write_outputs

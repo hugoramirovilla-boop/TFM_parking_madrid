@@ -1,0 +1,22 @@
+name: tfm-parking
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - pyarrow
+  - python-duckdb
+  - scikit-learn
+  - geopandas
+  - shapely
+  - pyproj
+  - pyogrio
+  - rtree
+  - requests
+  - folium
+  - matplotlib
+  - jupyter
+  - ipykernel
+  - ipython
+  - openpyxl
